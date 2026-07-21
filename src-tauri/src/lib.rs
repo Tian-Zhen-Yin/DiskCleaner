@@ -1,3 +1,4 @@
+pub mod analyzer;
 mod autostart;
 mod cleaner;
 mod config;
