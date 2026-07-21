@@ -1,0 +1,5 @@
+# Tauri build artifacts
+target/
+gen/schemas/
+.cargo/
+*.icns
