@@ -15,16 +15,35 @@ export type CleanCategory =
 
 // ===== Analyzer types (mirror Rust models.rs) =====
 
+export type CleanAdvice = "Safe" | "Caution" | "Keep" | "Unknown";
+
+export interface AdviceMeta {
+  label: string;
+  color: string;
+  bg: string;
+}
+
+export const ADVICE_META: Record<CleanAdvice, AdviceMeta> = {
+  Safe: { label: "安全可删", color: "#a6e3a1", bg: "rgba(166,227,161,0.12)" },
+  Caution: { label: "谨慎处理", color: "#f9e2af", bg: "rgba(249,226,175,0.12)" },
+  Keep: { label: "不建议删除", color: "#f38ba8", bg: "rgba(243,139,168,0.12)" },
+  Unknown: { label: "未知", color: "#6c7086", bg: "rgba(108,112,134,0.12)" },
+};
+
 export interface MonitorEntry {
   path: string;
   size_bytes: number;
   file_count: number;
   exists: boolean;
+  advice: CleanAdvice;
+  advice_reason: string;
 }
 
 export interface LargeFileEntry {
   path: string;
   size_bytes: number;
+  advice: CleanAdvice;
+  advice_reason: string;
 }
 
 export interface MonitorSnapshot {

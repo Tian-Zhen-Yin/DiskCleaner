@@ -1,5 +1,24 @@
 use serde::{Deserialize, Serialize};
 
+/// Cleanability classification for analyzer results.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum CleanAdvice {
+    /// Safe to delete - cache, temp, logs, dumps, etc.
+    Safe,
+    /// Proceed with caution - may be needed, user should verify.
+    Caution,
+    /// Keep - system files, program files, user data.
+    Keep,
+    /// Could not classify, user must judge.
+    Unknown,
+}
+
+impl Default for CleanAdvice {
+    fn default() -> Self {
+        CleanAdvice::Unknown
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum CleanCategory {
     WindowsTemp,
@@ -101,12 +120,20 @@ pub struct MonitorEntry {
     pub size_bytes: u64,
     pub file_count: u64,
     pub exists: bool,
+    #[serde(default)]
+    pub advice: CleanAdvice,
+    #[serde(default)]
+    pub advice_reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LargeFileEntry {
     pub path: String,
     pub size_bytes: u64,
+    #[serde(default)]
+    pub advice: CleanAdvice,
+    #[serde(default)]
+    pub advice_reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

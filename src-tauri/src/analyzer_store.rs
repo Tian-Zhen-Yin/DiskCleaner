@@ -202,8 +202,8 @@ mod tests {
             scan_type: "full".into(),
             drive_total: 1000,
             drive_used: 500,
-            monitor_dirs: vec![MonitorEntry { path: "C:/A".into(), size_bytes: 100, file_count: 1, exists: true }],
-            large_files: vec![LargeFileEntry { path: "C:/A/f.bin".into(), size_bytes: 50 }],
+            monitor_dirs: vec![MonitorEntry { path: "C:/A".into(), size_bytes: 100, file_count: 1, exists: true, advice: crate::models::CleanAdvice::Unknown, advice_reason: String::new() }],
+            large_files: vec![LargeFileEntry { path: "C:/A/f.bin".into(), size_bytes: 50, advice: crate::models::CleanAdvice::Unknown, advice_reason: String::new() }],
         }
     }
 

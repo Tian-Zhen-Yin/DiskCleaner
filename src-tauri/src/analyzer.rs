@@ -165,18 +165,26 @@ fn list_children_win(path: &Path) -> Vec<MonitorEntry> {
             let child = path.join(&name);
             if is_dir(data.dwFileAttributes) {
                 let s = walk_dir_fast_win(&child);
+                let pstr = child.to_string_lossy().into_owned();
+                let (advice, advice_reason) = crate::classify::classify(&pstr);
                 out.push(MonitorEntry {
-                    path: child.to_string_lossy().into_owned(),
+                    path: pstr,
                     size_bytes: s.size_bytes,
                     file_count: s.file_count,
                     exists: true,
+                    advice,
+                    advice_reason,
                 });
             } else {
+                let pstr = child.to_string_lossy().into_owned();
+                let (advice, advice_reason) = crate::classify::classify(&pstr);
                 out.push(MonitorEntry {
-                    path: child.to_string_lossy().into_owned(),
+                    path: pstr,
                     size_bytes: file_size_u64(data),
                     file_count: 1,
                     exists: true,
+                    advice,
+                    advice_reason,
                 });
             }
         }
@@ -199,10 +207,14 @@ pub fn list_children(path: &Path) -> Vec<MonitorEntry> {
                 let ft = match entry.file_type() { Ok(t) => t, Err(_) => continue };
                 if ft.is_dir() {
                     let s = walk_dir_fast_fallback(&p);
-                    tmp.push(MonitorEntry { path: p.to_string_lossy().into_owned(), size_bytes: s.size_bytes, file_count: s.file_count, exists: true });
+                    let pstr = p.to_string_lossy().into_owned();
+                    let (advice, advice_reason) = crate::classify::classify(&pstr);
+                    tmp.push(MonitorEntry { path: pstr, size_bytes: s.size_bytes, file_count: s.file_count, exists: true, advice, advice_reason });
                 } else if ft.is_file() {
                     let sz = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                    tmp.push(MonitorEntry { path: p.to_string_lossy().into_owned(), size_bytes: sz, file_count: 1, exists: true });
+                    let pstr = p.to_string_lossy().into_owned();
+                    let (advice, advice_reason) = crate::classify::classify(&pstr);
+                    tmp.push(MonitorEntry { path: pstr, size_bytes: sz, file_count: 1, exists: true, advice, advice_reason });
                 }
             }
         }
@@ -246,7 +258,10 @@ pub fn top_n_files(
     }
     let mut out: Vec<LargeFileEntry> = heap
         .into_iter()
-        .map(|std::cmp::Reverse((size, path))| LargeFileEntry { path, size_bytes: size })
+        .map(|std::cmp::Reverse((size, path))| {
+            let (advice, advice_reason) = crate::classify::classify(&path);
+            LargeFileEntry { path, size_bytes: size, advice, advice_reason }
+        })
         .collect();
     out.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
     out
@@ -259,15 +274,19 @@ pub fn scan_monitor_dirs(dirs: &[String]) -> Vec<MonitorEntry> {
     for raw in dirs {
         let p = Path::new(raw);
         if !p.exists() {
-            out.push(MonitorEntry { path: raw.clone(), size_bytes: 0, file_count: 0, exists: false });
+            let (advice, advice_reason) = crate::classify::classify(raw);
+            out.push(MonitorEntry { path: raw.clone(), size_bytes: 0, file_count: 0, exists: false, advice, advice_reason });
             continue;
         }
         let s = walk_dir_fast(p);
+        let (advice, advice_reason) = crate::classify::classify(raw);
         out.push(MonitorEntry {
             path: raw.clone(),
             size_bytes: s.size_bytes,
             file_count: s.file_count,
             exists: true,
+            advice,
+            advice_reason,
         });
     }
     out.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
@@ -307,10 +326,12 @@ where
     for (i, raw) in dirs.iter().enumerate() {
         let p = Path::new(raw);
         if !p.exists() {
-            monitor_entries.push(MonitorEntry { path: raw.clone(), size_bytes: 0, file_count: 0, exists: false });
+            let (advice, advice_reason) = crate::classify::classify(raw);
+            monitor_entries.push(MonitorEntry { path: raw.clone(), size_bytes: 0, file_count: 0, exists: false, advice, advice_reason });
         } else {
             let s = walk_dir_fast(p);
-            monitor_entries.push(MonitorEntry { path: raw.clone(), size_bytes: s.size_bytes, file_count: s.file_count, exists: true });
+            let (advice, advice_reason) = crate::classify::classify(raw);
+            monitor_entries.push(MonitorEntry { path: raw.clone(), size_bytes: s.size_bytes, file_count: s.file_count, exists: true, advice, advice_reason });
         }
         on_progress((i as u64) + 1, total_dirs);
     }
@@ -586,8 +607,8 @@ mod tests {
             scan_type: "full".into(),
             drive_total: 100,
             drive_used: 50,
-            monitor_dirs: dirs.into_iter().map(|(p, s)| MonitorEntry { path: p.into(), size_bytes: s, file_count: 0, exists: true }).collect(),
-            large_files: files.into_iter().map(|(p, s)| LargeFileEntry { path: p.into(), size_bytes: s }).collect(),
+            monitor_dirs: dirs.into_iter().map(|(p, s)| { let (ad, ar) = crate::classify::classify(p); MonitorEntry { path: p.into(), size_bytes: s, file_count: 0, exists: true, advice: ad, advice_reason: ar } }).collect(),
+            large_files: files.into_iter().map(|(p, s)| { let (ad, ar) = crate::classify::classify(p); LargeFileEntry { path: p.into(), size_bytes: s, advice: ad, advice_reason: ar } }).collect(),
         }
     }
 

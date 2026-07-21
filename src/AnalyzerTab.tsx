@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { AnalyzerConfig, DirDelta, MonitorEntry, MonitorSnapshot, SnapshotSummary, formatBytes, isSystemFile } from "./types";
+import { ADVICE_META, CleanAdvice } from "./types";
 
 export default function AnalyzerTab() {
   const [latest, setLatest] = useState<MonitorSnapshot | null>(null);
@@ -89,6 +90,33 @@ export default function AnalyzerTab() {
   const movedDirs = deltas?.filter((d) => d.kind === "moved") ?? [];
   const usagePct = latest && latest.drive_total > 0 ? (latest.drive_used / latest.drive_total) * 100 : 0;
 
+  const safeFiles = latest?.large_files.filter((f) => f.advice === "Safe") ?? [];
+  const safeBytes = safeFiles.reduce((s, f) => s + f.size_bytes, 0);
+  const cautionFiles = latest?.large_files.filter((f) => f.advice === "Caution") ?? [];
+  const cautionBytes = cautionFiles.reduce((s, f) => s + f.size_bytes, 0);
+
+
+function AdviceBadge({ advice, reason }: { advice: CleanAdvice; reason: string }) {
+  const meta = ADVICE_META[advice];
+  return (
+    <span
+      title={reason}
+      style={{
+        display: "inline-block",
+        padding: "1px 6px",
+        borderRadius: 4,
+        fontSize: 11,
+        color: meta.color,
+        background: meta.bg,
+        whiteSpace: "nowrap",
+        flexShrink: 0,
+      }}
+    >
+      {meta.label}
+    </span>
+  );
+}
+
   return (
     <div className="section">
       <div className="header" style={{ justifyContent: "space-between" }}>
@@ -137,8 +165,15 @@ export default function AnalyzerTab() {
                 <div style={{ marginLeft: 20, borderLeft: "2px solid #45475a", paddingLeft: 8 }}>
                   {drilldown[m.path].map((k) => (
                     <div key={k.path} className="item">
-                      <span className="dot" style={{ background: "#585b70" }} />
-                      <div className="item-info"><div className="item-title">{k.path.split("\\").pop()}</div></div>
+                      <span className="dot" style={{ background: ADVICE_META[k.advice ?? "Unknown"].color }} />
+                      <div className="item-info">
+                        <div className="item-title">{k.path.split("\\").pop()}</div>
+                        {k.advice_reason && (
+                          <div className="item-desc" style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                            <AdviceBadge advice={k.advice ?? "Unknown"} reason={k.advice_reason} />
+                          </div>
+                        )}
+                      </div>
                       <div className="item-size">{formatBytes(k.size_bytes)}</div>
                     </div>
                   ))}
@@ -151,12 +186,26 @@ export default function AnalyzerTab() {
 
       <div className="section">
         <h3 className="sub-title">大文件 Top {latest?.large_files.length ?? 0}</h3>
+        {latest && latest.large_files.length > 0 && (
+          <div style={{ display: "flex", gap: 16, marginBottom: 8, fontSize: 12 }}>
+            <span style={{ color: "#a6e3a1" }}>
+              ✓ 安全可删 {safeFiles.length} 个 ({formatBytes(safeBytes)})
+            </span>
+            <span style={{ color: "#f9e2af" }}>
+              ⚠ 谨慎处理 {cautionFiles.length} 个 ({formatBytes(cautionBytes)})
+            </span>
+          </div>
+        )}
         {!latest?.large_files.length && <div className="empty">暂无</div>}
         {latest?.large_files.slice(0, 50).map((f) => (
           <div key={f.path} className="item" style={{ opacity: isSystemFile(f.path) ? 0.5 : 1 }}>
-            <span className="dot" style={{ background: isSystemFile(f.path) ? "#6c7086" : "#f9e2af" }} />
+            <span className="dot" style={{ background: ADVICE_META[f.advice ?? "Unknown"].color }} />
             <div className="item-info">
               <div className="item-title">{f.path}{isSystemFile(f.path) && " (系统文件)"}</div>
+              <div className="item-desc" style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                <AdviceBadge advice={f.advice ?? "Unknown"} reason={f.advice_reason || ""} />
+                {f.advice_reason && <span style={{ color: "#6c7086" }}>{f.advice_reason}</span>}
+              </div>
             </div>
             <div className="item-size">{formatBytes(f.size_bytes)}</div>
           </div>
