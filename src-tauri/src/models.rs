@@ -92,3 +92,95 @@ pub struct HistoryRecord {
     pub total_removed: u64,
     pub entries: Vec<HistoryEntry>,
 }
+
+// ===== C 盘占用分析器 =====
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitorEntry {
+    pub path: String,
+    pub size_bytes: u64,
+    pub file_count: u64,
+    pub exists: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LargeFileEntry {
+    pub path: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitorSnapshot {
+    pub timestamp: String,
+    pub scan_type: String,
+    pub drive_total: u64,
+    pub drive_used: u64,
+    pub monitor_dirs: Vec<MonitorEntry>,
+    pub large_files: Vec<LargeFileEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirDelta {
+    pub path: String,
+    pub kind: String,
+    pub prev_bytes: u64,
+    pub curr_bytes: u64,
+    pub delta_bytes: i64,
+    pub pct: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotSummary {
+    pub timestamp: String,
+    pub scan_type: String,
+    pub drive_used: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalyzerConfig {
+    pub monitor_dirs: Vec<String>,
+    pub large_file_min_bytes: u64,
+    pub large_file_top_n: u32,
+    pub snapshot_keep_days: u32,
+}
+
+impl Default for AnalyzerConfig {
+    fn default() -> Self {
+        Self {
+            monitor_dirs: default_monitor_dirs(),
+            large_file_min_bytes: 500 * 1024 * 1024,
+            large_file_top_n: 50,
+            snapshot_keep_days: 14,
+        }
+    }
+}
+
+fn default_monitor_dirs() -> Vec<String> {
+    let mut out: Vec<String> = vec![
+        "C:\\Users".into(),
+        "C:\\ProgramData".into(),
+        "C:\\Program Files".into(),
+        "C:\\Program Files (x86)".into(),
+        "C:\\Windows".into(),
+        "C:\\Windows\\Installer".into(),
+        "C:\\Windows\\SoftwareDistribution".into(),
+        "C:\\Windows\\Temp".into(),
+    ];
+    let local = std::env::var("LOCALAPPDATA").ok();
+    let appdata = std::env::var("APPDATA").ok();
+    let profile = std::env::var("USERPROFILE").ok();
+    if let Some(l) = local {
+        out.push(l.clone());
+        out.push(format!("{}\\Docker", l));
+        out.push(format!("{}\\Packages", l));
+        out.push(format!("{}\\Programs", l));
+    }
+    if let Some(a) = appdata {
+        out.push(a);
+    }
+    if let Some(p) = profile {
+        out.push(format!("{}\\Downloads", p));
+        out.push(format!("{}\\Documents", p));
+    }
+    out
+}
