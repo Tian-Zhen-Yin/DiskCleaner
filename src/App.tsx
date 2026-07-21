@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import AnalyzerTab from "./AnalyzerTab";
 
 type CleanCategory =
   | "WindowsTemp"
@@ -179,6 +180,7 @@ function sourceLabel(s: string): string {
 
 export default function App() {
   const [diskInfo, setDiskInfo] = useState<DiskInfo | null>(null);
+  const [tab, setTab] = useState<"cleanup" | "analyzer">("cleanup");
   const [scanResults, setScanResults] = useState<Record<CleanCategory, ScanResult | null>>(
     emptyScan
   );
@@ -427,6 +429,15 @@ export default function App() {
         </button>
       </div>
 
+      <div className="tabs">
+        <button className={tab === "cleanup" ? "tab active" : "tab"} onClick={() => setTab("cleanup")}>清理</button>
+        <button className={tab === "analyzer" ? "tab active" : "tab"} onClick={() => setTab("analyzer")}>占用分析</button>
+      </div>
+
+      {tab === "analyzer" && <AnalyzerTab />}
+
+      {tab === "cleanup" && (
+        <>
       <div className="disk-info">
         <div style={{ minWidth: 60 }}>C: 盘</div>
         <div className="disk-bar">
@@ -711,6 +722,8 @@ export default function App() {
           ))}
         </div>
       </div>
+        </>
+      )}
     </div>
   );
 }

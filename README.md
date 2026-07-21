@@ -4,11 +4,24 @@
 
 ## 功能
 
-- 🧹 **可选清理项**
-  - Windows Temp 临时文件（`%TEMP%`、`C:\Windows\Temp`、CrashDumps）
-  - 浏览器缓存（Chrome / Edge / Firefox 的 Cache / Code Cache / GPUCache 等）
-  - Windows Update 缓存与日志（`SoftwareDistribution\Download`、`Logs\CBS`、`Logs\WindowsUpdate`）
+- 🧹 **11 类可选清理项**（默认勾选 9 个安全类，回收站/开发者缓存需手动勾选）
+  - Windows Temp 临时文件（%TEMP%、C:\Windows\Temp）
+  - 浏览器缓存（Chrome / Edge / Firefox 的 Cache / Code Cache / GPUCache / ShaderCache / DawnCache 等）
+  - Windows Update 缓存与日志（SoftwareDistribution\Download、Logs\CBS、Logs\WindowsUpdate）
+  - 回收站（C 盘，通过 Win32 API 清空）
+  - 缩略图与图标缓存（	humbcache_*.db、iconcache_*.db）
+  - Windows 错误报告 WER（ProgramData\...\WER、%LOCALAPPDATA%\...\WER）
+  - 内存转储（Memory.dmp、Minidump、LiveKernelReports）
+  - Windows 日志（Panther、setupapi*.log、Logs 子目录）
+  - 传递优化缓存（SoftwareDistribution\DeliveryOptimization）
+  - 预读区 Prefetch（Windows\Prefetch，系统自动重建）
+  - 开发者缓存（npm / pip / cargo / NuGet）
 - 📊 扫描预估可释放空间、显示 C 盘使用率
+- 🔍 **C 盘占用分析**（新增）
+  - 全盘扫描 Top-N 大文件，快速定位占空间的大文件
+  - 监控指定目录，追踪哪些目录在持续膨胀
+  - 快照对比（diff），查看两次扫描间哪些目录增长/缩小/消失
+  - 目录下钻，逐层查看子目录占用
 - ⏰ **定时执行**：
   - 应用内 tokio 定时器（前台运行时生效）
   - 通过 `schtasks` 注册系统级 Windows 任务计划，开机自动执行
@@ -26,6 +39,8 @@ DiskClearTool/
 ├── src/                      # React 前端
 │   ├── main.tsx
 │   ├── App.tsx
+│   ├── AnalyzerTab.tsx
+│   ├── types.ts
 │   └── styles.css
 └── src-tauri/                # Rust 后端
     ├── Cargo.toml
@@ -39,6 +54,9 @@ DiskClearTool/
         ├── models.rs         # 类型定义
         ├── paths.rs          # 各清理类别对应目录
         ├── cleaner.rs        # 扫描 / 清理逻辑 + 磁盘信息
+        ├── paths.rs          # 各清理类别对应目录
+        ├── analyzer.rs       # C 盘占用分析（全盘扫描/监控/大文件/diff）
+        ├── analyzer_store.rs # 分析快照持久化与索引
         ├── config.rs         # 配置持久化
         ├── scheduler.rs      # 应用内 tokio 定时器
         └── sys_task.rs       # Windows 任务计划注册
@@ -106,6 +124,17 @@ npm run tauri build
 4. 如果是用 tag 触发，还会自动创建一个 GitHub Release 把上面三种产物作为附件。
 
 
+## 占用分析
+
+除了清理功能，应用还提供 **C 盘占用分析**（顶部「占用分析」标签页）：
+
+1. **全盘扫描**：扫描 C 盘所有文件，列出 Top-N 大文件（默认阈值 100MB，可配置）。
+2. **监控目录**：添加需要追踪的目录（默认含 C:\Users、C:\ProgramData 等），每次扫描记录其大小变化。
+3. **快照对比**：选择两次扫描快照进行 diff，查看哪些目录增长、缩小或消失（疑似移动的目录会被自动抑制，避免误报）。
+4. **目录下钻**：点击监控目录可展开查看其子目录占用。
+5. **配置**：可调整大文件阈值、Top-N 数量、快照保留天数、监控目录列表。
+
+快照保存在 %LOCALAPPDATA%\DiskClearTool\snapshots\ 下，按保留天数自动清理。
 ## 使用说明
 
 1. 启动后点击 **「扫描」** 查看各项可释放空间。
