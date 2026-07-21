@@ -355,7 +355,7 @@ pub fn diff_snapshots(prev: &MonitorSnapshot, curr: &MonitorSnapshot) -> Vec<Dir
         .filter(|k| curr_map.contains_key(*k))
         .map(|&k| (k, prev_map[k], curr_map[k]))
         .collect();
-    for (path, p, c) in &changed {
+    for (path, _p, _c) in &changed {
         prev_map.remove(path);
         curr_map.remove(path);
     }
@@ -455,10 +455,6 @@ fn within_5pct(a: u64, b: u64) -> bool {
     if max == 0 { return true; }
     let diff = if a > b { a - b } else { b - a };
     (diff as f64) / (max as f64) <= 0.05
-}
-
-pub(crate) fn large_file_entries(pairs: Vec<(std::path::PathBuf, u64)>) -> Vec<LargeFileEntry> {
-    pairs.into_iter().map(|(p, s)| LargeFileEntry { path: p.to_string_lossy().into_owned(), size_bytes: s }).collect()
 }
 
 #[cfg(test)]

@@ -4,8 +4,50 @@
 //! (manual + future background scheduler).
 
 use crate::models::{MonitorSnapshot, SnapshotSummary};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Mutex;
+
+/// Persistent AnalyzerConfig at %APPDATA%\DiskClearTool\analyzer.json.
+pub struct AnalyzerConfigStore {
+    path: PathBuf,
+    inner: Mutex<crate::models::AnalyzerConfig>,
+}
+
+impl AnalyzerConfigStore {
+    pub fn new() -> Self {
+        let path = Self::default_path();
+        let cfg = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        Self { path, inner: Mutex::new(cfg) }
+    }
+
+    pub fn get(&self) -> crate::models::AnalyzerConfig {
+        self.inner.lock().unwrap().clone()
+    }
+
+    pub fn set(&self, cfg: crate::models::AnalyzerConfig) -> Result<(), String> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let json = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
+        std::fs::write(&self.path, json).map_err(|e| e.to_string())?;
+        *self.inner.lock().unwrap() = cfg;
+        Ok(())
+    }
+
+    fn default_path() -> PathBuf {
+        let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+        base.join("DiskClearTool").join("analyzer.json")
+    }
+}
+
+impl Default for AnalyzerConfigStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 pub struct SnapshotStore {
     root: PathBuf,
@@ -142,6 +184,7 @@ fn sanitize_ts(ts: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use crate::models::{LargeFileEntry, MonitorEntry};
 
     fn tmp_root(tag: &str) -> PathBuf {

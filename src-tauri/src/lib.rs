@@ -12,15 +12,99 @@ mod sys_task;
 use std::sync::Arc;
 
 use models::{
-    CleanCategory, CleanResult, DiskInfo, HistoryRecord, ScanResult, ScheduleConfig,
+    AnalyzerConfig, CleanCategory, CleanResult, DirDelta, DiskInfo, HistoryRecord,
+    MonitorEntry, MonitorSnapshot, ScanResult, ScheduleConfig, SnapshotSummary,
 };
 use scheduler::Scheduler;
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 
 struct AppState {
     config: config::ConfigStore,
     scheduler: Arc<Scheduler>,
     history: Arc<history::HistoryStore>,
+    analyzer_store: Arc<analyzer_store::SnapshotStore>,
+    analyzer_config: Arc<analyzer_store::AnalyzerConfigStore>,
+}
+
+fn drive_c_info() -> (u64, u64) {
+    cleaner::get_disk_info("C:")
+        .map(|d| (d.total_bytes, d.used_bytes))
+        .unwrap_or((0, 0))
+}
+
+// ===== Analyzer Tauri commands =====
+
+#[tauri::command]
+async fn analyze_full_scan(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<MonitorSnapshot, String> {
+    let cfg = state.analyzer_config.get();
+    let monitor_dirs = cfg.monitor_dirs.clone();
+    let min_bytes = cfg.large_file_min_bytes;
+    let top_n = cfg.large_file_top_n;
+    let auto_append: Vec<String> = state
+        .analyzer_store
+        .latest()
+        .map(|s| s.large_files.iter().map(|f| parent_dir_string(&f.path)).collect())
+        .unwrap_or_default();
+    let store = state.analyzer_store.clone();
+    let snap = tokio::task::spawn_blocking(move || {
+        let (total, used) = drive_c_info();
+        analyzer::scan_full(monitor_dirs, auto_append, min_bytes, top_n, total, used, |done, total_dirs| {
+            let _ = app.emit("analyze-scan-progress", serde_json::json!({ "done": done, "total": total_dirs }));
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    store.save(&snap)?;
+    Ok(snap)
+}
+
+#[tauri::command]
+async fn analyze_rescan_monitors(state: State<'_, AppState>) -> Result<Vec<MonitorEntry>, String> {
+    let dirs = state.analyzer_config.get().monitor_dirs;
+    tokio::task::spawn_blocking(move || Ok(analyzer::scan_monitor_dirs(&dirs)))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn analyze_get_latest(state: State<'_, AppState>) -> Option<MonitorSnapshot> {
+    state.analyzer_store.latest()
+}
+
+#[tauri::command]
+fn analyze_list_snapshots(state: State<'_, AppState>) -> Vec<SnapshotSummary> {
+    state.analyzer_store.list()
+}
+
+#[tauri::command]
+async fn analyze_drilldown(path: String) -> Result<Vec<MonitorEntry>, String> {
+    tokio::task::spawn_blocking(move || Ok(analyzer::list_children(std::path::Path::new(&path))))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn analyze_diff(prev_ts: String, curr_ts: String, state: State<'_, AppState>) -> Result<Vec<DirDelta>, String> {
+    let prev = state.analyzer_store.load(&prev_ts).ok_or("prev snapshot not found")?;
+    let curr = state.analyzer_store.load(&curr_ts).ok_or("curr snapshot not found")?;
+    Ok(analyzer::diff_snapshots(&prev, &curr))
+}
+
+#[tauri::command]
+fn analyze_get_config(state: State<'_, AppState>) -> AnalyzerConfig {
+    state.analyzer_config.get()
+}
+
+#[tauri::command]
+fn analyze_set_config(config: AnalyzerConfig, state: State<'_, AppState>) -> Result<(), String> {
+    state.analyzer_config.set(config)
+}
+
+fn parent_dir_string(path: &str) -> String {
+    std::path::Path::new(path)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 #[tauri::command]
@@ -131,6 +215,8 @@ pub fn run() {
         config: config_store,
         scheduler: scheduler.clone(),
         history: history_store.clone(),
+        analyzer_store: Arc::new(analyzer_store::SnapshotStore::new(analyzer_store::SnapshotStore::default_root())),
+        analyzer_config: Arc::new(analyzer_store::AnalyzerConfigStore::new()),
     };
 
     tauri::Builder::default()
@@ -159,6 +245,14 @@ pub fn run() {
             clear_history,
             get_autostart,
             set_autostart,
+            analyze_full_scan,
+            analyze_rescan_monitors,
+            analyze_get_latest,
+            analyze_list_snapshots,
+            analyze_drilldown,
+            analyze_diff,
+            analyze_get_config,
+            analyze_set_config,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
