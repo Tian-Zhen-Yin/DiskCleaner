@@ -185,29 +185,150 @@ fn list_children_win(path: &Path) -> Vec<MonitorEntry> {
 }
 
 pub fn list_children(path: &Path) -> Vec<MonitorEntry> {
-    let mut out = Vec::new();
+    let mut out: Vec<MonitorEntry>;
     #[cfg(windows)]
     {
         out = list_children_win(path);
     }
     #[cfg(not(windows))]
     {
+        let mut tmp = Vec::new();
         if let Ok(rd) = std::fs::read_dir(path) {
             for entry in rd.flatten() {
                 let p = entry.path();
                 let ft = match entry.file_type() { Ok(t) => t, Err(_) => continue };
                 if ft.is_dir() {
                     let s = walk_dir_fast_fallback(&p);
-                    out.push(MonitorEntry { path: p.to_string_lossy().into_owned(), size_bytes: s.size_bytes, file_count: s.file_count, exists: true });
+                    tmp.push(MonitorEntry { path: p.to_string_lossy().into_owned(), size_bytes: s.size_bytes, file_count: s.file_count, exists: true });
                 } else if ft.is_file() {
                     let sz = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                    out.push(MonitorEntry { path: p.to_string_lossy().into_owned(), size_bytes: sz, file_count: 1, exists: true });
+                    tmp.push(MonitorEntry { path: p.to_string_lossy().into_owned(), size_bytes: sz, file_count: 1, exists: true });
                 }
             }
         }
+        out = tmp;
     }
     out.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
     out
+}
+
+use crate::models::{MonitorSnapshot};
+use std::collections::BinaryHeap;
+use std::path::PathBuf;
+
+/// Keep the N largest files from `candidates`, descending.
+/// Uses a min-heap of size N so we don't sort the full set.
+pub fn top_n_files(
+    candidates: Vec<(PathBuf, u64)>,
+    min_bytes: u64,
+    n: usize,
+) -> Vec<LargeFileEntry> {
+    if n == 0 {
+        return Vec::new();
+    }
+    // Min-heap keyed by size so the smallest of the kept set is on top; pop it
+    // when a larger candidate arrives. Store (size, path) primitives so the
+    // heap's Ord bound is satisfied (LargeFileEntry is not Ord).
+    let mut heap: BinaryHeap<std::cmp::Reverse<(u64, String)>> = BinaryHeap::new();
+    for (path, size) in candidates {
+        if size < min_bytes {
+            continue;
+        }
+        let path_str = path.to_string_lossy().into_owned();
+        if heap.len() < n {
+            heap.push(std::cmp::Reverse((size, path_str)));
+        } else if let Some(std::cmp::Reverse((smallest, _))) = heap.peek() {
+            if size > *smallest {
+                heap.pop();
+                heap.push(std::cmp::Reverse((size, path_str)));
+            }
+        }
+    }
+    let mut out: Vec<LargeFileEntry> = heap
+        .into_iter()
+        .map(|std::cmp::Reverse((size, path))| LargeFileEntry { path, size_bytes: size })
+        .collect();
+    out.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+    out
+}
+
+/// Rescan the configured monitor directories (and any auto-appended dirs from
+/// the previous snapshot's large files). Fast: each dir is one walk_dir_fast.
+pub fn scan_monitor_dirs(dirs: &[String]) -> Vec<MonitorEntry> {
+    let mut out = Vec::with_capacity(dirs.len());
+    for raw in dirs {
+        let p = Path::new(raw);
+        if !p.exists() {
+            out.push(MonitorEntry { path: raw.clone(), size_bytes: 0, file_count: 0, exists: false });
+            continue;
+        }
+        let s = walk_dir_fast(p);
+        out.push(MonitorEntry {
+            path: raw.clone(),
+            size_bytes: s.size_bytes,
+            file_count: s.file_count,
+            exists: true,
+        });
+    }
+    out.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+    out
+}
+
+/// Full C-drive scan: walks every monitor dir AND the whole C:\ root to collect
+/// Top-N large files. `auto_append_dirs` lets the caller inject parent dirs of
+/// the previous snapshot's large files so emerging culprits stay tracked.
+/// `on_progress` receives (dirs_done, dirs_total) after each monitor dir.
+pub fn scan_full<F>(
+    monitor_dirs: Vec<String>,
+    auto_append_dirs: Vec<String>,
+    min_bytes: u64,
+    top_n: u32,
+    drive_total: u64,
+    drive_used: u64,
+    mut on_progress: F,
+) -> MonitorSnapshot
+where
+    F: FnMut(u64, u64),
+{
+    // Merge + dedupe monitor dirs, capped at 200 (spec). Drop-blank entries.
+    let mut dirs: Vec<String> = monitor_dirs;
+    for d in auto_append_dirs {
+        if !dirs.iter().any(|x| x.eq_ignore_ascii_case(&d)) {
+            dirs.push(d);
+        }
+    }
+    if dirs.len() > 200 {
+        dirs.truncate(200);
+    }
+    let total_dirs = dirs.len() as u64;
+
+    // 1. Walk each monitor dir for size entries.
+    let mut monitor_entries: Vec<MonitorEntry> = Vec::with_capacity(dirs.len());
+    for (i, raw) in dirs.iter().enumerate() {
+        let p = Path::new(raw);
+        if !p.exists() {
+            monitor_entries.push(MonitorEntry { path: raw.clone(), size_bytes: 0, file_count: 0, exists: false });
+        } else {
+            let s = walk_dir_fast(p);
+            monitor_entries.push(MonitorEntry { path: raw.clone(), size_bytes: s.size_bytes, file_count: s.file_count, exists: true });
+        }
+        on_progress((i as u64) + 1, total_dirs);
+    }
+    monitor_entries.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+
+    // 2. Walk the whole drive root once, collecting candidate files for Top-N.
+    let mut candidates: Vec<(PathBuf, u64)> = Vec::new();
+    collect_files(Path::new("C:\\"), &mut candidates);
+    let large = top_n_files(candidates, min_bytes, top_n as usize);
+
+    MonitorSnapshot {
+        timestamp: chrono::Local::now().to_rfc3339(),
+        scan_type: "full".into(),
+        drive_total,
+        drive_used,
+        monitor_dirs: monitor_entries,
+        large_files: large,
+    }
 }
 
 pub(crate) fn large_file_entries(pairs: Vec<(std::path::PathBuf, u64)>) -> Vec<LargeFileEntry> {
@@ -281,5 +402,59 @@ mod tests {
         assert!(kids[0].size_bytes >= kids[1].size_bytes);
         assert_eq!(kids[0].size_bytes, 500);
         cleanup(&root);
+    }
+
+    #[test]
+    fn top_n_files_keeps_largest_descending() {
+        // Sizes 1..5 MB, ask for top 3 -> expect [5,4,3].
+        let cands: Vec<(PathBuf, u64)> = (1..=5)
+            .map(|i| (PathBuf::from(format!("/f{}.bin", i)), i * 1024 * 1024))
+            .collect();
+        let got = top_n_files(cands, 0, 3);
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].size_bytes, 5 * 1024 * 1024);
+        assert_eq!(got[1].size_bytes, 4 * 1024 * 1024);
+        assert_eq!(got[2].size_bytes, 3 * 1024 * 1024);
+    }
+
+    #[test]
+    fn top_n_files_respects_min_bytes_filter() {
+        let cands = vec![
+            (PathBuf::from("/a"), 100),
+            (PathBuf::from("/b"), 500),
+            (PathBuf::from("/c"), 900),
+        ];
+        // min_bytes=400 -> only b and c qualify.
+        let got = top_n_files(cands, 400, 10);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].size_bytes, 900);
+        assert_eq!(got[1].size_bytes, 500);
+    }
+
+    #[test]
+    fn top_n_files_zero_n_returns_empty() {
+        let cands = vec![(PathBuf::from("/a"), 1000)];
+        assert!(top_n_files(cands, 0, 0).is_empty());
+    }
+
+    #[test]
+    fn scan_monitor_dirs_marks_missing_and_sorts_desc() {
+        let a = tmp("smd_a");
+        let b = tmp("smd_b");
+        write(&a.join("x.bin"), &vec![0; 100]);
+        write(&b.join("y.bin"), &vec![0; 500]);
+        let dirs = vec![
+            b.to_string_lossy().into_owned(),
+            a.to_string_lossy().into_owned(),
+            "/no/such/path/here".into(),
+        ];
+        let got = scan_monitor_dirs(&dirs);
+        assert_eq!(got.len(), 3);
+        assert!(got[0].size_bytes >= got[1].size_bytes);
+        assert!(got[0].exists);
+        assert_eq!(got[0].size_bytes, 500);
+        assert!(got[2].exists == false);
+        cleanup(&a);
+        cleanup(&b);
     }
 }
