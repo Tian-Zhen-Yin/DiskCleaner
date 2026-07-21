@@ -331,6 +331,132 @@ where
     }
 }
 
+use crate::models::DirDelta;
+use std::collections::HashMap;
+
+/// Diff two snapshots. Merges monitor_dirs and large_files by path key, then
+/// suppresses moves: a prev-only file paired with a curr-only file of the same
+/// extension and near-equal size (within 5%) is marked kind="moved" instead of
+/// emitting one added + one removed.
+pub fn diff_snapshots(prev: &MonitorSnapshot, curr: &MonitorSnapshot) -> Vec<DirDelta> {
+    let mut out: Vec<DirDelta> = Vec::new();
+
+    // ---- monitor dirs by path key ----
+    diff_by_key(&prev.monitor_dirs, &curr.monitor_dirs, &mut out);
+
+    // ---- large files: detect moves before emitting added/removed ----
+    let mut prev_map: HashMap<&str, u64> = prev.large_files.iter().map(|e| (e.path.as_str(), e.size_bytes)).collect();
+    let mut curr_map: HashMap<&str, u64> = curr.large_files.iter().map(|e| (e.path.as_str(), e.size_bytes)).collect();
+
+    // changed: in both. Collect first, then remove from maps before iterating
+    // the emitted deltas (avoids borrow-after-move on `common`).
+    let changed: Vec<(&str, u64, u64)> = prev_map
+        .keys()
+        .filter(|k| curr_map.contains_key(*k))
+        .map(|&k| (k, prev_map[k], curr_map[k]))
+        .collect();
+    for (path, p, c) in &changed {
+        prev_map.remove(path);
+        curr_map.remove(path);
+    }
+    for (path, p, c) in changed {
+        if p != c {
+            out.push(make_delta(path, "changed", p, c));
+        }
+    }
+
+    // prev-only and curr-only -> try to pair as moves
+    let prev_only: Vec<(&str, u64)> = prev_map.iter().map(|(k, v)| (*k, *v)).collect();
+    let curr_only: Vec<(&str, u64)> = curr_map.iter().map(|(k, v)| (*k, *v)).collect();
+    let mut matched_curr: Vec<bool> = vec![false; curr_only.len()];
+    for (p_path, p_size) in &prev_only {
+        let p_ext = ext(p_path);
+        // Find a curr-only item with same extension and size within 5%.
+        let pair = curr_only.iter().enumerate().find(|(i, (c_path, c_size))| {
+            !matched_curr[*i] && ext(c_path) == p_ext && within_5pct(*p_size, *c_size)
+        });
+        match pair {
+            Some((i, (c_path, c_size))) => {
+                matched_curr[i] = true;
+                // Represent the move as a single delta on the curr path; the
+                // prev path is mentioned via kind only. prev_bytes is the old
+                // location's size for reference.
+                out.push(DirDelta {
+                    path: c_path.to_string(),
+                    kind: "moved".into(),
+                    prev_bytes: *p_size,
+                    curr_bytes: *c_size,
+                    delta_bytes: 0,
+                    pct: 0.0,
+                });
+            }
+            None => {
+                out.push(DirDelta {
+                    path: p_path.to_string(),
+                    kind: "removed".into(),
+                    prev_bytes: *p_size,
+                    curr_bytes: 0,
+                    delta_bytes: -(*p_size as i64),
+                    pct: -100.0,
+                });
+            }
+        }
+    }
+    for (i, (c_path, c_size)) in curr_only.iter().enumerate() {
+        if !matched_curr[i] {
+            out.push(make_delta(c_path, "added", 0, *c_size));
+        }
+    }
+
+    // Sort by absolute delta magnitude (changed/added/removed), moved last.
+    out.sort_by(|a, b| {
+        let rank = |d: &DirDelta| match d.kind.as_str() { "moved" => 1, _ => 0 };
+        rank(a).cmp(&rank(b)).then_with(|| b.delta_bytes.unsigned_abs().cmp(&a.delta_bytes.unsigned_abs()))
+    });
+    out
+}
+
+fn diff_by_key(
+    prev: &[MonitorEntry],
+    curr: &[MonitorEntry],
+    out: &mut Vec<DirDelta>,
+) {
+    let prev_map: HashMap<&str, u64> = prev.iter().map(|e| (e.path.as_str(), e.size_bytes)).collect();
+    let curr_map: HashMap<&str, u64> = curr.iter().map(|e| (e.path.as_str(), e.size_bytes)).collect();
+    let mut keys: Vec<&str> = prev_map.keys().chain(curr_map.keys()).copied().collect();
+    keys.sort();
+    keys.dedup();
+    for path in keys {
+        match (prev_map.get(path), curr_map.get(path)) {
+            (Some(&p), Some(&c)) if p != c => out.push(make_delta(path, "changed", p, c)),
+            (Some(&p), None) => out.push(DirDelta { path: path.into(), kind: "removed".into(), prev_bytes: p, curr_bytes: 0, delta_bytes: -(p as i64), pct: -100.0 }),
+            (None, Some(&c)) => out.push(make_delta(path, "added", 0, c)),
+            _ => {}
+        }
+    }
+}
+
+fn make_delta(path: &str, kind: &str, prev: u64, curr: u64) -> DirDelta {
+    let delta = curr as i64 - prev as i64;
+    let pct = if prev == 0 { if curr == 0 { 0.0 } else { 100.0 } } else { (delta as f64) / (prev as f64) * 100.0 };
+    DirDelta { path: path.into(), kind: kind.into(), prev_bytes: prev, curr_bytes: curr, delta_bytes: delta, pct }
+}
+
+fn ext(path: &str) -> &str {
+    match path.rsplit('.').next() {
+        Some(e) if e.contains('\\') || e.contains('/') => "",
+        Some(e) => e,
+        None => "",
+    }
+}
+
+fn within_5pct(a: u64, b: u64) -> bool {
+    let max = a.max(b);
+    if max == 0 { return true; }
+    let diff = if a > b { a - b } else { b - a };
+    (diff as f64) / (max as f64) <= 0.05
+}
+
 pub(crate) fn large_file_entries(pairs: Vec<(std::path::PathBuf, u64)>) -> Vec<LargeFileEntry> {
     pairs.into_iter().map(|(p, s)| LargeFileEntry { path: p.to_string_lossy().into_owned(), size_bytes: s }).collect()
 }
@@ -456,5 +582,67 @@ mod tests {
         assert!(got[2].exists == false);
         cleanup(&a);
         cleanup(&b);
+    }
+
+    fn snap(ts: &str, dirs: Vec<(&str, u64)>, files: Vec<(&str, u64)>) -> MonitorSnapshot {
+        MonitorSnapshot {
+            timestamp: ts.into(),
+            scan_type: "full".into(),
+            drive_total: 100,
+            drive_used: 50,
+            monitor_dirs: dirs.into_iter().map(|(p, s)| MonitorEntry { path: p.into(), size_bytes: s, file_count: 0, exists: true }).collect(),
+            large_files: files.into_iter().map(|(p, s)| LargeFileEntry { path: p.into(), size_bytes: s }).collect(),
+        }
+    }
+
+    #[test]
+    fn diff_detects_changed_added_removed() {
+        let prev = snap("t1",
+            vec![("C:/A", 100), ("C:/B", 50)],
+            vec![("C:/A/f.bin", 1000)]);
+        // B grows, C added, A unchanged, file f.bin removed (no move since nothing matches).
+        let curr = snap("t2",
+            vec![("C:/A", 100), ("C:/B", 200), ("C:/C", 30)],
+            vec![]);
+        let d = diff_snapshots(&prev, &curr);
+        let kinds: Vec<(&str, &str)> = d.iter().map(|x| (x.kind.as_str(), x.path.as_str())).collect();
+        assert!(kinds.contains(&("changed", "C:/B")));
+        assert!(kinds.contains(&("added", "C:/C")));
+        assert!(kinds.contains(&("removed", "C:/A/f.bin")));
+        // B: 50 -> 200, delta +150, pct +300.
+        let b = d.iter().find(|x| x.path == "C:/B").unwrap();
+        assert_eq!(b.delta_bytes, 150);
+        assert_eq!(b.pct, 300.0);
+    }
+
+    #[test]
+    fn diff_suppresses_move_same_ext_similar_size() {
+        let prev = snap("t1", vec![], vec![("C:/old/f.bin", 1000)]);
+        let curr = snap("t2", vec![], vec![("C:/new/g.bin", 1000)]);
+        let d = diff_snapshots(&prev, &curr);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].kind, "moved");
+        assert_eq!(d[0].path, "C:/new/g.bin");
+    }
+
+    #[test]
+    fn diff_does_not_suppress_when_size_differs_beyond_5pct() {
+        let prev = snap("t1", vec![], vec![("C:/old/f.bin", 1000)]);
+        let curr = snap("t2", vec![], vec![("C:/new/g.bin", 2000)]);
+        let d = diff_snapshots(&prev, &curr);
+        // 100% size difference -> not a move, emit added + removed.
+        assert_eq!(d.len(), 2);
+        assert!(d.iter().any(|x| x.kind == "added"));
+        assert!(d.iter().any(|x| x.kind == "removed"));
+    }
+
+    #[test]
+    fn diff_new_file_pct_is_100() {
+        let prev = snap("t1", vec![("C:/A", 0)], vec![]);
+        let curr = snap("t2", vec![("C:/A", 50)], vec![]);
+        let d = diff_snapshots(&prev, &curr);
+        let a = d.iter().find(|x| x.path == "C:/A").unwrap();
+        assert_eq!(a.kind, "changed");
+        assert_eq!(a.pct, 100.0);
     }
 }
