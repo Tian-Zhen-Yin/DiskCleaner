@@ -77,6 +77,12 @@ export interface AnalyzerConfig {
   snapshot_keep_days: number;
 }
 
+export interface DeleteResult {
+  deleted_count: number;
+  freed_bytes: number;
+  errors: string[];
+}
+
 export function formatBytes(bytes: number): string {
   if (bytes <= 0) return "0 B";
   const units = ["B", "KB", "MB", "GB", "TB"];

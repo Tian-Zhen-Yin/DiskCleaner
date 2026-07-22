@@ -156,6 +156,13 @@ pub struct DirDelta {
     pub pct: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteResult {
+    pub deleted_count: u64,
+    pub freed_bytes: u64,
+    pub errors: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct SnapshotSummary {
     pub timestamp: String,

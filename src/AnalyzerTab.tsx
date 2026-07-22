@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { AnalyzerConfig, DirDelta, MonitorEntry, MonitorSnapshot, SnapshotSummary, formatBytes, isSystemFile } from "./types";
+import { AnalyzerConfig, DeleteResult, DirDelta, MonitorEntry, MonitorSnapshot, SnapshotSummary, formatBytes, isSystemFile } from "./types";
 import { ADVICE_META, CleanAdvice } from "./types";
 
 export default function AnalyzerTab() {
@@ -17,6 +17,9 @@ export default function AnalyzerTab() {
   const [newDir, setNewDir] = useState("");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [log, setLog] = useState<string[]>([]);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteProgress, setDeleteProgress] = useState<{ deleted: number; total: number; freed_bytes: number } | null>(null);
+  const [deletedPaths, setDeletedPaths] = useState<Set<string>>(new Set());
 
   const pushLog = (m: string) => setLog((p) => [...p.slice(-50), m]);
 
@@ -25,7 +28,8 @@ export default function AnalyzerTab() {
     invoke<SnapshotSummary[]>("analyze_list_snapshots").then(setSnapshots).catch((e) => pushLog(`加载快照列表失败: ${e}`));
     invoke<AnalyzerConfig>("analyze_get_config").then(setConfig).catch((e) => pushLog(`加载配置失败: ${e}`));
     const un = listen<{ done: number; total: number }>("analyze-scan-progress", (e) => setProgress(e.payload));
-    return () => { void un.then((fn) => fn()); };
+    const unDel = listen<{ deleted: number; total: number; freed_bytes: number }>("analyze-delete-progress", (e) => setDeleteProgress(e.payload));
+    return () => { void un.then((fn) => fn()); void unDel.then((fn) => fn()); };
   }, []);
 
   const fullScan = async () => {
@@ -90,10 +94,47 @@ export default function AnalyzerTab() {
   const movedDirs = deltas?.filter((d) => d.kind === "moved") ?? [];
   const usagePct = latest && latest.drive_total > 0 ? (latest.drive_used / latest.drive_total) * 100 : 0;
 
-  const safeFiles = latest?.large_files.filter((f) => f.advice === "Safe") ?? [];
+  const visibleLargeFiles = latest?.large_files.filter((f) => !deletedPaths.has(f.path)) ?? [];
+  const safeFiles = visibleLargeFiles.filter((f) => f.advice === "Safe");
   const safeBytes = safeFiles.reduce((s, f) => s + f.size_bytes, 0);
-  const cautionFiles = latest?.large_files.filter((f) => f.advice === "Caution") ?? [];
+  const cautionFiles = visibleLargeFiles.filter((f) => f.advice === "Caution");
   const cautionBytes = cautionFiles.reduce((s, f) => s + f.size_bytes, 0);
+
+  const deleteOne = async (path: string) => {
+    setDeleting(true);
+    try {
+      const res = await invoke<DeleteResult>("analyze_delete_files", { paths: [path] });
+      if (res.deleted_count > 0) {
+        setDeletedPaths((prev) => new Set(prev).add(path));
+        pushLog(`已删除 1 个文件，释放 ${formatBytes(res.freed_bytes)}`);
+      }
+      res.errors.forEach((e) => pushLog(e));
+    } catch (e) { pushLog(`删除失败: ${e}`); }
+    finally { setDeleting(false); setDeleteProgress(null); }
+  };
+
+  const deleteAllSafe = async () => {
+    if (safeFiles.length === 0) return;
+    if (!window.confirm(`确定删除 ${safeFiles.length} 个安全可删文件，共 ${formatBytes(safeBytes)}？此操作不可撤销。`)) return;
+    const paths = safeFiles.map((f) => f.path);
+    setDeleting(true);
+    setDeleteProgress({ deleted: 0, total: paths.length, freed_bytes: 0 });
+    try {
+      const res = await invoke<DeleteResult>("analyze_delete_files", { paths });
+      const failed = new Set(paths.filter((p) => res.errors.some((e) => e.includes(p))));
+      const deleted = paths.filter((p) => !failed.has(p));
+      if (deleted.length > 0) {
+        setDeletedPaths((prev) => {
+          const next = new Set(prev);
+          deleted.forEach((p) => next.add(p));
+          return next;
+        });
+      }
+      res.errors.forEach((e) => pushLog(e));
+      pushLog(`批量删除完成：成功 ${res.deleted_count} 个，释放 ${formatBytes(res.freed_bytes)}${res.errors.length > 0 ? `，失败 ${res.errors.length} 个` : ""}`);
+    } catch (e) { pushLog(`批量删除失败: ${e}`); }
+    finally { setDeleting(false); setDeleteProgress(null); }
+  };
 
 
 function AdviceBadge({ advice, reason }: { advice: CleanAdvice; reason: string }) {
@@ -122,8 +163,8 @@ function AdviceBadge({ advice, reason }: { advice: CleanAdvice; reason: string }
       <div className="header" style={{ justifyContent: "space-between" }}>
         <h2>占用分析</h2>
         <div>
-          <button onClick={fullScan} disabled={scanning}>{scanning ? "扫描中..." : "全盘扫描"}</button>
-          <button className="secondary" onClick={rescan} disabled={scanning} style={{ marginLeft: 8 }}>重扫监控目录</button>
+          <button onClick={fullScan} disabled={scanning || deleting}>{scanning ? "扫描中..." : "全盘扫描"}</button>
+          <button className="secondary" onClick={rescan} disabled={scanning || deleting} style={{ marginLeft: 8 }}>重扫监控目录</button>
         </div>
       </div>
       {progress && <div className="item-desc">扫描进度：{progress.done}/{progress.total} 目录</div>}
@@ -185,19 +226,24 @@ function AdviceBadge({ advice, reason }: { advice: CleanAdvice; reason: string }
       </div>
 
       <div className="section">
-        <h3 className="sub-title">大文件 Top {latest?.large_files.length ?? 0}</h3>
+        <h3 className="sub-title">大文件 Top {visibleLargeFiles.length}</h3>
         {latest && latest.large_files.length > 0 && (
-          <div style={{ display: "flex", gap: 16, marginBottom: 8, fontSize: 12 }}>
+          <div style={{ display: "flex", gap: 16, marginBottom: 8, fontSize: 12, alignItems: "center", flexWrap: "wrap" }}>
             <span style={{ color: "#a6e3a1" }}>
               ✓ 安全可删 {safeFiles.length} 个 ({formatBytes(safeBytes)})
             </span>
             <span style={{ color: "#f9e2af" }}>
               ⚠ 谨慎处理 {cautionFiles.length} 个 ({formatBytes(cautionBytes)})
             </span>
+            {safeFiles.length > 0 && (
+              <button className="secondary" onClick={deleteAllSafe} disabled={deleting} style={{ marginLeft: "auto", color: "#f38ba8", borderColor: "#f38ba8" }}>
+                {deleting && deleteProgress ? `删除中 ${deleteProgress.deleted}/${deleteProgress.total}` : "一键清理全部安全可删"}
+              </button>
+            )}
           </div>
         )}
-        {!latest?.large_files.length && <div className="empty">暂无</div>}
-        {latest?.large_files.slice(0, 50).map((f) => (
+        {!visibleLargeFiles.length && <div className="empty">暂无</div>}
+        {visibleLargeFiles.slice(0, 50).map((f) => (
           <div key={f.path} className="item" style={{ opacity: isSystemFile(f.path) ? 0.5 : 1 }}>
             <span className="dot" style={{ background: ADVICE_META[f.advice ?? "Unknown"].color }} />
             <div className="item-info">
@@ -207,7 +253,14 @@ function AdviceBadge({ advice, reason }: { advice: CleanAdvice; reason: string }
                 {f.advice_reason && <span style={{ color: "#6c7086" }}>{f.advice_reason}</span>}
               </div>
             </div>
-            <div className="item-size">{formatBytes(f.size_bytes)}</div>
+            <div className="item-size" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              {formatBytes(f.size_bytes)}
+              {f.advice === "Safe" && (
+                <button onClick={() => deleteOne(f.path)} disabled={deleting} title="删除此文件" style={{ background: "none", border: "none", cursor: deleting ? "not-allowed" : "pointer", padding: 2, display: "flex", alignItems: "center", opacity: deleting ? 0.5 : 1, color: "#f38ba8" }}>
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6" /><path d="M19 6l-2 14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L5 6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /></svg>
+                </button>
+              )}
+            </div>
           </div>
         ))}
       </div>
