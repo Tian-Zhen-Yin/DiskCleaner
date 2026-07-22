@@ -7,7 +7,7 @@
 ## 需求
 
 - 仅 `CleanAdvice::Safe` 类文件可从分析器删除;Caution / Keep / Unknown 不提供删除入口
-- 单个删除:每个 Safe 文件旁边有删除按钮,点击直接删,不弹确认
+- 单个删除:每个 Safe 文件旁边有删除按钮,点击直接删除,不弹出确认框(用户主动点击即表示删除意图)
 - 批量删除:汇总行有「一键清理全部安全可删」按钮,点击弹确认框(显示将删 X 个文件 Y GB),确认后执行
 - 删除后前端从大文件列表移除已删项,汇总数字(安全可删 X 个 / Y GB)实时递减
 - 批量删除仅针对当前大文件列表中的 Safe 项,不涉及监控目录下钻数据
@@ -93,11 +93,12 @@ export interface DeleteResult {
 - 成功后:从 `latest.large_files` 中移除所有已删路径
 - 部分失败:pushLog 报告 errors
 
-**局部更新逻辑**:
-- 维护一个 `deletedPaths: Set<string>` 状态
-- 删除成功后把路径加入 Set
-- `latest.large_files` 的渲染用 `.filter(f => !deletedPaths.has(f.path))` 过滤
-- 汇总数字同样基于过滤后的列表计算
+**局部更新逻辑**(不触发任何重扫描,纯前端状态变更):
+- 维护一个 `deletedPaths: Set<string>` 状态,初始为空
+- 删除成功后把已删路径加入 Set
+- 大文件列表渲染时用 `.filter(f => !deletedPaths.has(f.path))` 过滤掉已删文件
+- 汇总数字(`safeFiles` / `safeBytes`)基于过滤后的列表通过 `useMemo` 自动重算
+- 不调用任何后端扫描命令,下次用户手动全盘扫描时数据自然刷新
 
 **UI 防护**:
 - 删除进行中所有删除按钮 disabled
