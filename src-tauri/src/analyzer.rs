@@ -52,11 +52,63 @@ pub fn walk_dir_fast(root: &Path) -> DirSummary {
     { walk_dir_fast_fallback(root) }
 }
 
-pub fn collect_files(root: &Path, out: &mut Vec<(std::path::PathBuf, u64)>) {
+/// Streaming Top-N accumulator: keeps the N largest files seen so far in a
+/// min-heap, so peak memory stays O(n) regardless of how many files the walker
+/// visits. Replaces the old two-phase design (materialize the full file list
+/// into a Vec, then filter+heap) that could hold hundreds of MB on a
+/// multi-million-file drive.
+pub struct TopNCollector {
+    heap: std::collections::BinaryHeap<std::cmp::Reverse<(u64, String)>>,
+    min_bytes: u64,
+    n: usize,
+}
+
+impl TopNCollector {
+    pub fn new(min_bytes: u64, n: usize) -> Self {
+        Self { heap: std::collections::BinaryHeap::new(), min_bytes, n }
+    }
+
+    /// Consider one file. Below `min_bytes` or `n==0` are dropped with no
+    /// allocation. A full heap evicts its smallest entry only when the new
+    /// candidate is strictly larger (ties keep insertion order).
+    pub fn consider(&mut self, path: String, size: u64) {
+        if self.n == 0 || size < self.min_bytes {
+            return;
+        }
+        if self.heap.len() < self.n {
+            self.heap.push(std::cmp::Reverse((size, path)));
+        } else if let Some(std::cmp::Reverse((smallest, _))) = self.heap.peek() {
+            if size > *smallest {
+                self.heap.pop();
+                self.heap.push(std::cmp::Reverse((size, path)));
+            }
+        }
+    }
+
+    /// Drain into a size-descending list, tagging each path with its
+    /// cleanability advice via classify::classify.
+    pub fn finish(self) -> Vec<LargeFileEntry> {
+        let mut out: Vec<LargeFileEntry> = self
+            .heap
+            .into_iter()
+            .map(|std::cmp::Reverse((size, path))| {
+                let (advice, advice_reason) = crate::classify::classify(&path);
+                LargeFileEntry { path, size_bytes: size, advice, advice_reason }
+            })
+            .collect();
+        out.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+        out
+    }
+}
+
+/// Walk `root` recursively, streaming every regular file into `collector`.
+/// The walker feeds the min-heap directly instead of materializing a full Vec,
+/// keeping peak memory at O(top_n) rather than O(total files on the drive).
+pub fn collect_top_n(root: &Path, collector: &mut TopNCollector) {
     #[cfg(windows)]
-    { collect_files_win(root, out) }
+    { collect_top_n_win(root, collector) }
     #[cfg(not(windows))]
-    { collect_files_fallback(root, out) }
+    { collect_top_n_fallback(root, collector) }
 }
 
 #[cfg(windows)]
@@ -80,14 +132,17 @@ fn walk_dir_fast_win(root: &Path) -> DirSummary {
 }
 
 #[cfg(windows)]
-fn collect_files_win(root: &Path, out: &mut Vec<(std::path::PathBuf, u64)>) {
+fn collect_top_n_win(root: &Path, collector: &mut TopNCollector) {
     for_each_entry(root, |data| {
         if !is_dots(&data.cFileName) && !is_reparse(data.dwFileAttributes) {
             if is_dir(data.dwFileAttributes) {
                 let child = root.join(from_wide(&data.cFileName));
-                collect_files_win(&child, out);
+                collect_top_n_win(&child, collector);
             } else {
-                out.push((root.join(from_wide(&data.cFileName)), file_size_u64(data)));
+                collector.consider(
+                    root.join(from_wide(&data.cFileName)).to_string_lossy().into_owned(),
+                    file_size_u64(data),
+                );
             }
         }
     });
@@ -114,11 +169,11 @@ fn walk_dir_fast_fallback(root: &Path) -> DirSummary {
 }
 
 #[cfg(not(windows))]
-fn collect_files_fallback(root: &Path, out: &mut Vec<(std::path::PathBuf, u64)>) {
+fn collect_top_n_fallback(root: &Path, collector: &mut TopNCollector) {
     for entry in walkdir::WalkDir::new(root).follow_links(false).into_iter().filter_map(|e| e.ok()) {
         if entry.file_type().is_file() {
             if let Ok(md) = entry.metadata() {
-                out.push((entry.path().to_path_buf(), md.len()));
+                collector.consider(entry.path().to_string_lossy().into_owned(), md.len());
             }
         }
     }
@@ -225,46 +280,21 @@ pub fn list_children(path: &Path) -> Vec<MonitorEntry> {
 }
 
 use crate::models::{MonitorSnapshot};
-use std::collections::BinaryHeap;
 use std::path::PathBuf;
 
-/// Keep the N largest files from `candidates`, descending.
-/// Uses a min-heap of size N so we don't sort the full set.
+/// Keep the N largest files from an already-materialized candidate list. Thin
+/// wrapper over TopNCollector; the production scan path (scan_full) uses
+/// collect_top_n to stream files into the heap without materializing them first.
 pub fn top_n_files(
     candidates: Vec<(PathBuf, u64)>,
     min_bytes: u64,
     n: usize,
 ) -> Vec<LargeFileEntry> {
-    if n == 0 {
-        return Vec::new();
-    }
-    // Min-heap keyed by size so the smallest of the kept set is on top; pop it
-    // when a larger candidate arrives. Store (size, path) primitives so the
-    // heap's Ord bound is satisfied (LargeFileEntry is not Ord).
-    let mut heap: BinaryHeap<std::cmp::Reverse<(u64, String)>> = BinaryHeap::new();
+    let mut c = TopNCollector::new(min_bytes, n);
     for (path, size) in candidates {
-        if size < min_bytes {
-            continue;
-        }
-        let path_str = path.to_string_lossy().into_owned();
-        if heap.len() < n {
-            heap.push(std::cmp::Reverse((size, path_str)));
-        } else if let Some(std::cmp::Reverse((smallest, _))) = heap.peek() {
-            if size > *smallest {
-                heap.pop();
-                heap.push(std::cmp::Reverse((size, path_str)));
-            }
-        }
+        c.consider(path.to_string_lossy().into_owned(), size);
     }
-    let mut out: Vec<LargeFileEntry> = heap
-        .into_iter()
-        .map(|std::cmp::Reverse((size, path))| {
-            let (advice, advice_reason) = crate::classify::classify(&path);
-            LargeFileEntry { path, size_bytes: size, advice, advice_reason }
-        })
-        .collect();
-    out.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
-    out
+    c.finish()
 }
 
 /// Rescan the configured monitor directories (and any auto-appended dirs from
@@ -293,64 +323,9 @@ pub fn scan_monitor_dirs(dirs: &[String]) -> Vec<MonitorEntry> {
     out
 }
 
-/// Full C-drive scan: walks every monitor dir AND the whole C:\ root to collect
-/// Top-N large files. `auto_append_dirs` lets the caller inject parent dirs of
-/// the previous snapshot's large files so emerging culprits stay tracked.
-/// `on_progress` receives (dirs_done, dirs_total) after each monitor dir.
-pub fn scan_full<F>(
-    monitor_dirs: Vec<String>,
-    auto_append_dirs: Vec<String>,
-    min_bytes: u64,
-    top_n: u32,
-    drive_total: u64,
-    drive_used: u64,
-    mut on_progress: F,
-) -> MonitorSnapshot
-where
-    F: FnMut(u64, u64),
-{
-    // Merge + dedupe monitor dirs, capped at 200 (spec). Drop-blank entries.
-    let mut dirs: Vec<String> = monitor_dirs;
-    for d in auto_append_dirs {
-        if !dirs.iter().any(|x| x.eq_ignore_ascii_case(&d)) {
-            dirs.push(d);
-        }
-    }
-    if dirs.len() > 200 {
-        dirs.truncate(200);
-    }
-    let total_dirs = dirs.len() as u64;
 
-    // 1. Walk each monitor dir for size entries.
-    let mut monitor_entries: Vec<MonitorEntry> = Vec::with_capacity(dirs.len());
-    for (i, raw) in dirs.iter().enumerate() {
-        let p = Path::new(raw);
-        if !p.exists() {
-            let (advice, advice_reason) = crate::classify::classify(raw);
-            monitor_entries.push(MonitorEntry { path: raw.clone(), size_bytes: 0, file_count: 0, exists: false, advice, advice_reason });
-        } else {
-            let s = walk_dir_fast(p);
-            let (advice, advice_reason) = crate::classify::classify(raw);
-            monitor_entries.push(MonitorEntry { path: raw.clone(), size_bytes: s.size_bytes, file_count: s.file_count, exists: true, advice, advice_reason });
-        }
-        on_progress((i as u64) + 1, total_dirs);
-    }
-    monitor_entries.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
 
-    // 2. Walk the whole drive root once, collecting candidate files for Top-N.
-    let mut candidates: Vec<(PathBuf, u64)> = Vec::new();
-    collect_files(Path::new("C:\\"), &mut candidates);
-    let large = top_n_files(candidates, min_bytes, top_n as usize);
 
-    MonitorSnapshot {
-        timestamp: chrono::Local::now().to_rfc3339(),
-        scan_type: "full".into(),
-        drive_total,
-        drive_used,
-        monitor_dirs: monitor_entries,
-        large_files: large,
-    }
-}
 
 use crate::models::DirDelta;
 use std::collections::HashMap;
@@ -522,15 +497,35 @@ mod tests {
     }
 
     #[test]
-    fn collect_files_gathers_all_sizes() {
+    fn collect_top_n_streams_all_files_into_heap() {
         let root = tmp("collect");
         write(&root.join("a.bin"), &vec![0; 100]);
         write(&root.join("d").join("b.bin"), &vec![0; 200]);
-        let mut out = Vec::new();
-        collect_files(&root, &mut out);
-        assert_eq!(out.len(), 2);
-        let total: u64 = out.iter().map(|(_, s)| *s).sum();
+        // min_bytes=0, n large enough to keep everything.
+        let mut c = TopNCollector::new(0, 10);
+        collect_top_n(&root, &mut c);
+        let got = c.finish();
+        assert_eq!(got.len(), 2);
+        let total: u64 = got.iter().map(|e| e.size_bytes).sum();
         assert_eq!(total, 300);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn collect_top_n_evicts_smaller_files() {
+        // Five files of decreasing size; keep only the top 2.
+        let root = tmp("evict");
+        write(&root.join("f1.bin"), &vec![0; 50]);
+        write(&root.join("f2.bin"), &vec![0; 40]);
+        write(&root.join("f3.bin"), &vec![0; 30]);
+        write(&root.join("f4.bin"), &vec![0; 20]);
+        write(&root.join("f5.bin"), &vec![0; 10]);
+        let mut c = TopNCollector::new(0, 2);
+        collect_top_n(&root, &mut c);
+        let got = c.finish();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].size_bytes, 50);
+        assert_eq!(got[1].size_bytes, 40);
         cleanup(&root);
     }
 
@@ -601,6 +596,70 @@ mod tests {
         cleanup(&b);
     }
 
+    #[test]
+    fn drive_scan_single_pass_sizes_monitors_and_collects_topn() {
+        // Tree (root is a tempdir standing in for C:\):
+        //   Users/u/docs/big.iso        (1000)  <- under Users monitor
+        //   Users/u/Cache/junk.bin      (500)   <- under Users monitor
+        //   Windows/Temp/t.tmp          (300)   <- under Windows AND Windows\Temp
+        //   pagefile.sys                (900)   <- NOT under any monitor (Top-N only)
+        //   Missing/                    (empty) <- monitor dir that does not exist
+        let root = tmp("drive");
+        write(&root.join("Users").join("u").join("docs").join("big.iso"), &vec![0; 1000]);
+        write(&root.join("Users").join("u").join("Cache").join("junk.bin"), &vec![0; 500]);
+        write(&root.join("Windows").join("Temp").join("t.tmp"), &vec![0; 300]);
+        write(&root.join("pagefile.sys"), &vec![0; 900]);
+
+        let monitors = vec![
+            root.join("Users").to_string_lossy().into_owned(),
+            root.join("Windows").to_string_lossy().into_owned(),
+            root.join("Windows").join("Temp").to_string_lossy().into_owned(),
+            root.join("Missing").to_string_lossy().into_owned(),
+        ];
+        let mut scan = DriveScan::new(&monitors, 0, 10);
+        let mut active = Vec::new();
+        let mut last = (0u64, 0u64);
+        collect_drive_with_monitors(&root, &mut scan, &mut active, &mut |d, t| {
+            last = (d, t);
+        });
+
+        // Users: big.iso(1000) + junk.bin(500) = 1500, 2 files.
+        let u_key = norm_lower(&root.join("Users"));
+        let u_idx = scan.monitor_idx[&u_key];
+        assert_eq!(scan.sizes[u_idx], 1500);
+        assert_eq!(scan.counts[u_idx], 2);
+
+        // Windows (parent of Temp): the Temp file counts here too (overlap).
+        let w_key = norm_lower(&root.join("Windows"));
+        let w_idx = scan.monitor_idx[&w_key];
+        assert_eq!(scan.sizes[w_idx], 300);
+        assert_eq!(scan.counts[w_idx], 1);
+
+        // Windows\Temp (nested monitor): same file, charged independently.
+        let t_key = norm_lower(&root.join("Windows").join("Temp"));
+        let t_idx = scan.monitor_idx[&t_key];
+        assert_eq!(scan.sizes[t_idx], 300);
+        assert_eq!(scan.counts[t_idx], 1);
+
+        // pagefile.sys at root: feeds Top-N, never attributed to a monitor.
+        // Missing dir: never entered.
+        let m_key = norm_lower(&root.join("Missing"));
+        let m_idx = scan.monitor_idx[&m_key];
+        assert!(!scan.reached[m_idx]);
+
+        // Top-N collected all 4 files regardless of monitor membership.
+        let large = scan.collector.finish();
+        assert_eq!(large.len(), 4);
+        let total: u64 = large.iter().map(|e| e.size_bytes).sum();
+        assert_eq!(total, 2700);
+
+        // Three monitors completed during the walk; Missing was not reached so
+        // it is not counted here (scan_full accounts for it afterward).
+        assert_eq!(last, (3, 4));
+
+        cleanup(&root);
+    }
+
     fn snap(ts: &str, dirs: Vec<(&str, u64)>, files: Vec<(&str, u64)>) -> MonitorSnapshot {
         MonitorSnapshot {
             timestamp: ts.into(),
@@ -661,5 +720,269 @@ mod tests {
         let a = d.iter().find(|x| x.path == "C:/A").unwrap();
         assert_eq!(a.kind, "changed");
         assert_eq!(a.pct, 100.0);
+    }
+}
+/// Normalize a path for case-insensitive monitor matching: lowercased, with
+/// `/` folded to `\`. Used both to key the monitor table and to derive the
+/// lookup key for each directory the walker enters.
+fn norm_lower(p: &Path) -> String {
+    p.to_string_lossy().to_lowercase().replace('/', r"\")
+}
+
+/// True if `raw` is (case-insensitively) the C: drive or lives under it. The
+/// single-pass walk only covers C:\, so monitors on other drives are walked
+/// separately.
+fn is_on_c_drive(raw: &str) -> bool {
+    let lower = raw.to_lowercase().replace('/', r"\");
+    lower == "c:" || lower.starts_with(r"c:\")
+}
+
+/// Accumulator for the single-pass drive scan. Owns the Top-N collector and the
+/// per-monitor-dir size/count tallies. Monitor dirs are keyed by their
+/// normalized (lowercased, backslash) path so the walker can detect, as it
+/// descends, when it has entered a monitored directory.
+struct DriveScan {
+    monitor_idx: HashMap<String, usize>,
+    sizes: Vec<u64>,
+    counts: Vec<u64>,
+    reached: Vec<bool>,
+    completed: u64,
+    total: u64,
+    collector: TopNCollector,
+}
+
+impl DriveScan {
+    fn new(monitors: &[String], min_bytes: u64, top_n: usize) -> Self {
+        let mut monitor_idx = HashMap::new();
+        // First occurrence wins; scan_full already dedupes case-insensitively,
+        // so this just defends against path-variant collisions.
+        for (i, m) in monitors.iter().enumerate() {
+            monitor_idx.entry(norm_lower(Path::new(m))).or_insert(i);
+        }
+        let len = monitors.len();
+        Self {
+            monitor_idx,
+            sizes: vec![0; len],
+            counts: vec![0; len],
+            reached: vec![false; len],
+            completed: 0,
+            total: len as u64,
+            collector: TopNCollector::new(min_bytes, top_n),
+        }
+    }
+
+    /// If `key` (the normalized path of the directory we just entered) names a
+    /// monitor dir, push its index onto `active` and mark it reached. Returns
+    /// whether a monitor was pushed (so the caller pops on the way back up).
+    fn enter(&mut self, key: &str, active: &mut Vec<usize>) -> bool {
+        if let Some(&i) = self.monitor_idx.get(key) {
+            self.reached[i] = true;
+            active.push(i);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Advance the completed-monitors counter; returns the new (done, total).
+    fn note_done(&mut self) -> (u64, u64) {
+        self.completed += 1;
+        (self.completed, self.total)
+    }
+}
+
+/// Single-pass drive walk: descend `root`, feeding every file to the Top-N
+/// collector and adding each file's size to every monitor dir currently on the
+/// `active` stack (i.e. every monitor dir that is an ancestor-or-self of the
+/// file). Produces both the large-file list and the monitor-dir tallies from
+/// one traversal instead of two.
+fn collect_drive_with_monitors<F: FnMut(u64, u64)>(
+    root: &Path,
+    scan: &mut DriveScan,
+    active: &mut Vec<usize>,
+    on_progress: &mut F,
+) {
+    #[cfg(windows)]
+    {
+        scan_drive_win(root, scan, active, on_progress);
+    }
+    #[cfg(not(windows))]
+    {
+        scan_drive_fallback(root, scan, active, on_progress);
+    }
+}
+
+#[cfg(windows)]
+fn scan_drive_win<F: FnMut(u64, u64)>(
+    root: &Path,
+    scan: &mut DriveScan,
+    active: &mut Vec<usize>,
+    on_progress: &mut F,
+) {
+    let key = norm_lower(root);
+    let pushed = scan.enter(&key, active);
+    // Collect child dirs during enumeration, recurse only after the enumeration
+    // closure is dropped. Otherwise the closure's &mut scan borrow would alias
+    // the recursive call's &mut scan borrow and fail to compile.
+    let mut subdirs: Vec<std::path::PathBuf> = Vec::new();
+    for_each_entry(root, |data| {
+        if !is_dots(&data.cFileName) && !is_reparse(data.dwFileAttributes) {
+            if is_dir(data.dwFileAttributes) {
+                subdirs.push(root.join(from_wide(&data.cFileName)));
+            } else {
+                let size = file_size_u64(data);
+                let pstr = root
+                    .join(from_wide(&data.cFileName))
+                    .to_string_lossy()
+                    .into_owned();
+                scan.collector.consider(pstr, size);
+                for &i in &*active {
+                    scan.sizes[i] = scan.sizes[i].saturating_add(size);
+                    scan.counts[i] = scan.counts[i].saturating_add(1);
+                }
+            }
+        }
+    });
+    for child in subdirs {
+        scan_drive_win(&child, scan, active, on_progress);
+    }
+    if pushed {
+        active.pop();
+        let (done, total) = scan.note_done();
+        on_progress(done, total);
+    }
+}
+
+#[cfg(not(windows))]
+fn scan_drive_fallback<F: FnMut(u64, u64)>(
+    root: &Path,
+    scan: &mut DriveScan,
+    active: &mut Vec<usize>,
+    on_progress: &mut F,
+) {
+    let key = norm_lower(root);
+    let pushed = scan.enter(&key, active);
+    let mut subdirs: Vec<std::path::PathBuf> = Vec::new();
+    // Skip symlinks to avoid cycles; mirrors the Windows branch's reparse skip.
+    if let Ok(rd) = std::fs::read_dir(root) {
+        for entry in rd.flatten() {
+            let ft = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if ft.is_symlink() {
+                continue;
+            }
+            if ft.is_dir() {
+                subdirs.push(entry.path());
+            } else if ft.is_file() {
+                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                let pstr = entry.path().to_string_lossy().into_owned();
+                scan.collector.consider(pstr, size);
+                for &i in &*active {
+                    scan.sizes[i] = scan.sizes[i].saturating_add(size);
+                    scan.counts[i] = scan.counts[i].saturating_add(1);
+                }
+            }
+        }
+    }
+    for child in subdirs {
+        scan_drive_fallback(&child, scan, active, on_progress);
+    }
+    if pushed {
+        active.pop();
+        let (done, total) = scan.note_done();
+        on_progress(done, total);
+    }
+}
+
+/// Full C-drive scan: ONE walk of C:\ that simultaneously streams files into the
+/// Top-N heap and accumulates each monitor dir's size via an active-set stack.
+/// `auto_append_dirs` lets the caller inject parent dirs of the previous
+/// snapshot's large files so emerging culprits stay tracked. `on_progress`
+/// receives (monitors_done, monitors_total) as each monitor dir finishes.
+pub fn scan_full<F>(
+    monitor_dirs: Vec<String>,
+    auto_append_dirs: Vec<String>,
+    min_bytes: u64,
+    top_n: u32,
+    drive_total: u64,
+    drive_used: u64,
+    mut on_progress: F,
+) -> MonitorSnapshot
+where
+    F: FnMut(u64, u64),
+{
+    // Merge + dedupe monitor dirs, capped at 200 (spec). Drop-blank entries.
+    let mut dirs: Vec<String> = monitor_dirs;
+    for d in auto_append_dirs {
+        if !dirs.iter().any(|x| x.eq_ignore_ascii_case(&d)) {
+            dirs.push(d);
+        }
+    }
+    if dirs.len() > 200 {
+        dirs.truncate(200);
+    }
+
+    // Single pass over C:\: stream files into the Top-N heap AND accumulate
+    // each monitor dir's size via an active-set stack. A file under a nested
+    // monitor (e.g. C:\Windows\Temp) is charged to EVERY enclosing monitor
+    // (C:\Windows AND C:\Windows\Temp), matching the old per-dir walks exactly.
+    // Files outside any monitor dir (e.g. pagefile/hiberfil at C:\ root) still
+    // feed Top-N. Replaces the old two-phase design that walked every monitor
+    // dir for size, then re-walked all of C:\ for Top-N.
+    let mut scan = DriveScan::new(&dirs, min_bytes, top_n as usize);
+    let mut active: Vec<usize> = Vec::new();
+    collect_drive_with_monitors(Path::new("C:\\"), &mut scan, &mut active, &mut on_progress);
+
+    // Build monitor entries. C: monitors reached during the walk already carry
+    // their tallies; unreached dirs (missing, access-blocked, or on another
+    // drive) are resolved here and counted toward progress so the bar reaches
+    // 100% instead of stalling.
+    let mut monitor_entries: Vec<MonitorEntry> = Vec::with_capacity(dirs.len());
+    for (i, raw) in dirs.iter().enumerate() {
+        let (advice, advice_reason) = crate::classify::classify(raw);
+        if scan.reached[i] {
+            monitor_entries.push(MonitorEntry {
+                path: raw.clone(),
+                size_bytes: scan.sizes[i],
+                file_count: scan.counts[i],
+                exists: true,
+                advice,
+                advice_reason,
+            });
+        } else {
+            let p = Path::new(raw);
+            let exists = p.exists();
+            let (size_bytes, file_count) = if exists && !is_on_c_drive(raw) {
+                // Monitor on another drive: the C:\ walk never touched it.
+                let s = walk_dir_fast(p);
+                (s.size_bytes, s.file_count)
+            } else {
+                (0, 0)
+            };
+            monitor_entries.push(MonitorEntry {
+                path: raw.clone(),
+                size_bytes,
+                file_count,
+                exists,
+                advice,
+                advice_reason,
+            });
+            let (done, total) = scan.note_done();
+            on_progress(done, total);
+        }
+    }
+    monitor_entries.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+
+    let large = scan.collector.finish();
+
+    MonitorSnapshot {
+        timestamp: chrono::Local::now().to_rfc3339(),
+        scan_type: "full".into(),
+        drive_total,
+        drive_used,
+        monitor_dirs: monitor_entries,
+        large_files: large,
     }
 }

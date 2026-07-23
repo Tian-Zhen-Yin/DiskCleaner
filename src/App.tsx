@@ -423,7 +423,13 @@ export default function App() {
   return (
     <div className="app">
       <div className="header">
-        <h1>🧹 Windows C 盘清理工具</h1>
+        <div className="app-bar">
+          <div className="brand-logo">🧹</div>
+          <div className="brand-text">
+            <h1>Windows C 盘清理工具</h1>
+            <span className="brand-sub">扫描 · 清理 · 占用分析</span>
+          </div>
+        </div>
         <button className="secondary" onClick={refreshDisk}>
           刷新磁盘信息
         </button>
@@ -439,18 +445,24 @@ export default function App() {
       {tab === "cleanup" && (
         <>
       <div className="disk-info">
-        <div style={{ minWidth: 60 }}>C: 盘</div>
-        <div className="disk-bar">
+        <div className="disk-drive">C: 盘</div>
+        <div
+          className="disk-bar"
+          data-level={
+            usagePercent >= 90 ? "high" : usagePercent >= 70 ? "mid" : "low"
+          }
+        >
           <div
             className="disk-bar-fill"
             style={{ width: `${usagePercent}%` }}
           />
         </div>
+        <div className="disk-pct">{usagePercent.toFixed(1)}%</div>
         <div className="disk-text">
           {diskInfo
             ? `${formatBytes(diskInfo.used_bytes)} / ${formatBytes(
                 diskInfo.total_bytes
-              )} 已使用 (剩余 ${formatBytes(diskInfo.free_bytes)})`
+              )}（剩余 ${formatBytes(diskInfo.free_bytes)}）`
             : "加载中..."}
         </div>
       </div>
@@ -461,7 +473,11 @@ export default function App() {
           {ALL_CATEGORIES.map((c) => {
             const r = scanResults[c];
             return (
-              <label key={c} className="item">
+              <label
+                key={c}
+                className="item"
+                data-active={selected.has(c)}
+              >
                 <input
                   type="checkbox"
                   checked={selected.has(c)}

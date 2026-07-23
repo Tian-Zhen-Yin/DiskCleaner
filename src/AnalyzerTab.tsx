@@ -171,8 +171,12 @@ function AdviceBadge({ advice, reason }: { advice: CleanAdvice; reason: string }
 
       {latest && (
         <div className="disk-info">
-          <div style={{ minWidth: 60 }}>C: 盘</div>
-          <div className="disk-bar"><div className="disk-bar-fill" style={{ width: `${usagePct}%` }} /></div>
+          <div className="disk-drive">C: 盘</div>
+          <div
+            className="disk-bar"
+            data-level={usagePct >= 90 ? "high" : usagePct >= 70 ? "mid" : "low"}
+          ><div className="disk-bar-fill" style={{ width: `${usagePct}%` }} /></div>
+          <div className="disk-pct">{usagePct.toFixed(1)}%</div>
           <div className="disk-text">
             {formatBytes(latest.drive_used)} / {formatBytes(latest.drive_total)}（扫描于 {new Date(latest.timestamp).toLocaleString()}，{latest.scan_type === "full" ? "全盘" : "仅监控目录"}）
           </div>
@@ -190,7 +194,10 @@ function AdviceBadge({ advice, reason }: { advice: CleanAdvice; reason: string }
               <div className="item" onClick={() => toggle(m.path)} style={{ cursor: "pointer" }}>
                 <span className="dot" style={{ background: m.exists ? "#89b4fa" : "#6c7086" }} />
                 <div className="item-info">
-                  <div className="item-title">{m.path}{!m.exists && " (不存在)"}</div>
+                  <div className="item-title">
+                    <span className="path-truncate" title={m.path}>{m.path}</span>
+                    {!m.exists && <span style={{ flexShrink: 0, color: "#6c7086" }}>(不存在)</span>}
+                  </div>
                   <div className="item-desc">{m.file_count.toLocaleString()} 文件</div>
                 </div>
                 <div className="item-size" style={{ display: "flex", alignItems: "center", gap: 12 }}>
@@ -208,7 +215,9 @@ function AdviceBadge({ advice, reason }: { advice: CleanAdvice; reason: string }
                     <div key={k.path} className="item">
                       <span className="dot" style={{ background: ADVICE_META[k.advice ?? "Unknown"].color }} />
                       <div className="item-info">
-                        <div className="item-title">{k.path.split("\\").pop()}</div>
+                        <div className="item-title">
+                          <span className="path-truncate" title={k.path}>{k.path.split("\\").pop()}</span>
+                        </div>
                         {k.advice_reason && (
                           <div className="item-desc" style={{ display: "flex", gap: 6, alignItems: "center" }}>
                             <AdviceBadge advice={k.advice ?? "Unknown"} reason={k.advice_reason} />
@@ -247,7 +256,10 @@ function AdviceBadge({ advice, reason }: { advice: CleanAdvice; reason: string }
           <div key={f.path} className="item" style={{ opacity: isSystemFile(f.path) ? 0.5 : 1 }}>
             <span className="dot" style={{ background: ADVICE_META[f.advice ?? "Unknown"].color }} />
             <div className="item-info">
-              <div className="item-title">{f.path}{isSystemFile(f.path) && " (系统文件)"}</div>
+              <div className="item-title">
+                <span className="path-truncate" title={f.path}>{f.path}</span>
+                {isSystemFile(f.path) && <span style={{ flexShrink: 0, color: "#6c7086" }}>(系统文件)</span>}
+              </div>
               <div className="item-desc" style={{ display: "flex", gap: 6, alignItems: "center" }}>
                 <AdviceBadge advice={f.advice ?? "Unknown"} reason={f.advice_reason || ""} />
                 {f.advice_reason && <span style={{ color: "#6c7086" }}>{f.advice_reason}</span>}

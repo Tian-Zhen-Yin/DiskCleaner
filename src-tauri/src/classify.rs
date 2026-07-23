@@ -1,8 +1,11 @@
 use crate::models::CleanAdvice;
 
 /// Classify a file or directory path into a cleanability level with a short
-/// human-readable reason. The checks run most-specific-first: a file inside
-/// `\Cache\` wins over the broader `\AppData\` rule, etc.
+/// human-readable reason. Path matching is SEGMENT-exact: a rule for the
+/// `Cache` directory matches the path component `cache` but not `mycache` or
+/// `cachex`, so user folders with cache-like names are never misread as safe.
+/// Checks run most-specific-first: a file inside `\Cache\` wins over the
+/// broader `\AppData\` rule, etc.
 pub fn classify(path: &str) -> (CleanAdvice, String) {
     let lower = path.to_lowercase().replace('/', r"\");
     let filename = lower.rsplit('\\').next().unwrap_or("");
@@ -20,15 +23,12 @@ pub fn classify(path: &str) -> (CleanAdvice, String) {
     }
 
     // ---- 2. Known-safe locations: cache / temp / logs / dumps ----
-    if is_safe_cache(&lower, filename) {
-        return safe(match safe_reason(&lower, filename) {
-            Some(r) => r,
-            None => "缓存文件，安全可删".into(),
-        });
+    if let Some(reason) = safe_cache_reason(&lower, filename) {
+        return safe(reason);
     }
 
     // ---- 3. Downloads folder: caution (user may want these) ----
-    if lower.contains(r"\downloads\") {
+    if has_seg(&lower, "downloads") {
         let ext = ext_lower(filename);
         if matches!(ext.as_str(), "exe" | "msi" | "msix" | "iso" | "zip" | "rar" | "7z" | "pkg") {
             return caution("下载的安装包/压缩包，确认不再需要后可删".into());
@@ -37,35 +37,35 @@ pub fn classify(path: &str) -> (CleanAdvice, String) {
     }
 
     // ---- 4. Windows.old: safe to remove ----
-    if lower.starts_with(r"c:\windows.old") {
+    if is_under(&lower, r"c:\windows.old") {
         return safe("旧系统备份，确认不需要回退后可删".into());
     }
 
     // ---- 5. Windows Installer: caution ----
-    if lower.starts_with(r"c:\windows\installer") {
-        if lower.contains(r"$patchcache$") {
+    if is_under(&lower, r"c:\windows\installer") {
+        if has_seg(&lower, "$patchcache$") {
             return safe("Installer 补丁缓存，安全可删".into());
         }
         return caution("Windows Installer 文件，删除可能影响软件卸载/修复".into());
     }
 
     // ---- 6. WinSxS: keep ----
-    if lower.contains(r"\winsxs\") || lower.ends_with(r"\winsxs") {
+    if has_seg(&lower, "winsxs") {
         return keep("组件存储，手动删除会损坏系统，可用 DISM 清理".into());
     }
 
     // ---- 7. Program Files: keep ----
-    if lower.starts_with(r"c:\program files\") || lower.starts_with(r"c:\program files (x86)\") {
+    if is_under(&lower, r"c:\program files") || is_under(&lower, r"c:\program files (x86)") {
         return keep("已安装程序目录，删除会导致软件无法运行".into());
     }
 
     // ---- 8. Windows system core: keep ----
-    if lower.starts_with(r"c:\windows\system32\") || lower.starts_with(r"c:\windows\syswow64\") {
+    if is_under(&lower, r"c:\windows\system32") || is_under(&lower, r"c:\windows\syswow64") {
         return keep("Windows 系统核心目录，不建议删除".into());
     }
 
     // ---- 9. $Recycle.Bin: safe ----
-    if lower.starts_with(r"c:\$recycle.bin") {
+    if is_under(&lower, r"c:\$recycle.bin") {
         return safe("回收站内容，清空后不可恢复".into());
     }
 
@@ -82,108 +82,129 @@ pub fn classify(path: &str) -> (CleanAdvice, String) {
     (CleanAdvice::Unknown, "无法判断，请自行评估".into())
 }
 
-fn is_safe_cache(lower: &str, filename: &str) -> bool {
-    // Temp directories
-    lower.contains(r"\temp\")
-        || lower.ends_with(r"\temp")
-        || lower.contains(r"\tmp\")
-        || lower.contains(r"\crashdumps")
-        // Browser / app cache directories
-        || lower.contains(r"\cache\")
-        || lower.contains(r"\code cache\")
-        || lower.contains(r"\gpucache\")
-        || lower.contains(r"\shadercache\")
-        || lower.contains(r"\grshadercache\")
-        || lower.contains(r"\dawncache\")
-        || lower.contains(r"\dawngraphitecache\")
-        || lower.contains(r"\service worker\")
-        || lower.contains(r"\startupcache\")
-        // Windows Update / delivery optimization
-        || lower.contains(r"\softwaredistribution\download")
-        || lower.contains(r"\softwaredistribution\deliveryoptimization")
-        // WER
-        || lower.contains(r"\wer\")
-        || lower.ends_with(r"\wer")
-        // Dumps
-        || lower.contains(r"\minidump\")
-        || lower.contains(r"\livekernelreports")
-        || filename == "memory.dmp"
-        || filename.ends_with(".dmp")
-        // Prefetch
-        || lower.contains(r"\prefetch\")
-        || filename.ends_with(".pf")
-        // Panther (upgrade logs)
-        || lower.contains(r"\panther\")
-        // Log files
-        || filename.ends_with(".log")
-        || lower.contains(r"\logs\cbs\")
-        || lower.contains(r"\logs\windowsupdate\")
-        // Thumbnails
-        || filename.starts_with("thumbcache_")
-        || filename.starts_with("iconcache_")
-        // Dev caches
-        || lower.contains(r"\npm-cache\")
-        || lower.contains(r"\pip\cache\")
-        || lower.contains(r"\.cargo\registry\cache\")
-        || lower.contains(r"\.cargo\registry\src\")
-        || lower.contains(r"\nuget\v3-cache\")
-        // Old temp extensions
-        || filename.ends_with(".tmp")
-        || filename.ends_with(".temp")
+/// True if `seg` appears as an exact `\`-delimited path component in `lower`
+/// (already lowercased, with `/` normalized to `\`). Segment-precise: "cache"
+/// matches the component `cache` but never `mycache` or `cachex`. The leading
+/// drive token (e.g. `c:`) is just another component, which is harmless since
+/// no rule keys on it.
+fn has_seg(lower: &str, seg: &str) -> bool {
+    lower.split('\\').any(|p| p == seg)
 }
 
-fn safe_reason(lower: &str, filename: &str) -> Option<String> {
-    if lower.contains(r"\temp\") || lower.ends_with(r"\temp") {
-        return Some("临时文件，安全可删".into());
+/// True if a `child` component appears immediately after a `parent` component
+/// somewhere in the path (`...\parent\child\...` or ending `...\parent\child`).
+/// Both names must match their components exactly; this is what makes
+/// `softwaredistribution\download` precise (the plural `downloads` won't match).
+fn has_seg_child(lower: &str, parent: &str, child: &str) -> bool {
+    let mut prev_match = false;
+    for p in lower.split('\\') {
+        if prev_match && p == child {
+            return true;
+        }
+        prev_match = p == parent;
     }
-    if lower.contains(r"\cache\") || lower.contains(r"\code cache\")
-        || lower.contains(r"\gpucache\") || lower.contains(r"\shadercache\")
-        || lower.contains(r"\dawncache\") || lower.contains(r"\dawngraphitecache\")
-        || lower.contains(r"\grshadercache\")
+    false
+}
+
+/// True if `lower` is exactly `dir` or lives under it (`dir\...`). Replaces the
+/// old `starts_with("c:\\windows.old")` form that also matched
+/// `c:\windows.oldbackup` because it lacked a trailing path delimiter.
+fn is_under(lower: &str, dir: &str) -> bool {
+    lower == dir || lower.starts_with(&format!("{}\\", dir))
+}
+
+/// Single source of truth for "known-safe" locations: returns the human reason
+/// when the path matches a safe rule, else `None`. Merging the old
+/// `is_safe_cache` gate and `safe_reason` lookup into one pass removes the drift
+/// where the two could disagree. More specific rules (dev caches) run before
+/// generic ones (temp) so the reason text stays accurate.
+fn safe_cache_reason(lower: &str, filename: &str) -> Option<String> {
+    // --- Dev caches (specific first, so their reason survives) ---
+    if has_seg(lower, "npm-cache") {
+        return Some("npm 缓存，安全可删（下次安装会重建）".into());
+    }
+    if has_seg_child(lower, "pip", "cache") {
+        return Some("pip 缓存，安全可删（下次安装会重建）".into());
+    }
+    if has_seg(lower, ".cargo")
+        && (has_seg_child(lower, "registry", "cache") || has_seg_child(lower, "registry", "src"))
+    {
+        return Some("Cargo 注册表缓存，安全可删".into());
+    }
+    if has_seg_child(lower, "nuget", "v3-cache") {
+        return Some("NuGet 缓存，安全可删".into());
+    }
+
+    // --- Windows Update / delivery optimization ---
+    if has_seg_child(lower, "softwaredistribution", "download") {
+        return Some("Windows Update 下载缓存，安全可删".into());
+    }
+    if has_seg_child(lower, "softwaredistribution", "deliveryoptimization") {
+        return Some("传递优化缓存，安全可删".into());
+    }
+
+    // --- Browser / app caches (segment-exact: "MyCache" no longer matches) ---
+    if has_seg(lower, "cache")
+        || has_seg(lower, "code cache")
+        || has_seg(lower, "gpucache")
+        || has_seg(lower, "shadercache")
+        || has_seg(lower, "grshadercache")
+        || has_seg(lower, "dawncache")
+        || has_seg(lower, "dawngraphitecache")
+        || has_seg(lower, "service worker")
+        || has_seg(lower, "startupcache")
     {
         return Some("浏览器/应用缓存，安全可删".into());
     }
-    if lower.contains(r"\softwaredistribution\download") {
-        return Some("Windows Update 下载缓存，安全可删".into());
-    }
-    if lower.contains(r"\softwaredistribution\deliveryoptimization") {
-        return Some("传递优化缓存，安全可删".into());
-    }
-    if lower.contains(r"\wer\") {
+
+    // --- WER ---
+    if has_seg(lower, "wer") {
         return Some("Windows 错误报告，安全可删".into());
     }
-    if lower.contains(r"\minidump\") || lower.contains(r"\livekernelreports")
-        || filename == "memory.dmp" || filename.ends_with(".dmp")
+
+    // --- Crash dumps ---
+    if has_seg(lower, "minidump")
+        || has_seg(lower, "crashdumps")
+        || has_seg(lower, "livekernelreports")
+        || filename == "memory.dmp"
+        || filename.ends_with(".dmp")
     {
         return Some("崩溃转储文件，安全可删（删除丢失崩溃现场）".into());
     }
-    if lower.contains(r"\prefetch\") || filename.ends_with(".pf") {
+
+    // --- Prefetch ---
+    if has_seg(lower, "prefetch") || filename.ends_with(".pf") {
         return Some("预读文件，系统会自动重建".into());
     }
-    if lower.contains(r"\panther\") {
+
+    // --- Panther (upgrade logs) ---
+    if has_seg(lower, "panther") {
         return Some("Windows 升级日志，安全可删".into());
     }
+
+    // --- Windows log subdirs ---
+    if has_seg_child(lower, "logs", "cbs") || has_seg_child(lower, "logs", "windowsupdate") {
+        return Some("Windows 日志，安全可删".into());
+    }
+
+    // --- Generic log files ---
     if filename.ends_with(".log") {
         return Some("日志文件，安全可删".into());
     }
+
+    // --- Thumbnails / icon cache ---
     if filename.starts_with("thumbcache_") || filename.starts_with("iconcache_") {
         return Some("缩略图/图标缓存，系统会自动重建".into());
     }
-    if lower.contains(r"\npm-cache\") {
-        return Some("npm 缓存，安全可删（下次安装会重建）".into());
-    }
-    if lower.contains(r"\pip\cache\") {
-        return Some("pip 缓存，安全可删（下次安装会重建）".into());
-    }
-    if lower.contains(r"\.cargo\registry\") {
-        return Some("Cargo 注册表缓存，安全可删".into());
-    }
-    if lower.contains(r"\nuget\v3-cache\") {
-        return Some("NuGet 缓存，安全可删".into());
+
+    // --- Temp (generic, last so dev caches above keep their own reason) ---
+    if has_seg(lower, "temp") || has_seg(lower, "tmp") {
+        return Some("临时文件，安全可删".into());
     }
     if filename.ends_with(".tmp") || filename.ends_with(".temp") {
         return Some("临时文件，安全可删".into());
     }
+
     None
 }
 
@@ -308,5 +329,67 @@ mod tests {
         let (a, r) = classify(r"C:\Users\test\AppData\Local\npm-cache\_cacache\tmp\tmp.tar");
         assert_eq!(a, CleanAdvice::Safe);
         assert!(r.contains("npm"));
+    }
+
+    // ===== Segment-precision regression tests =====
+    // These pin the fix for substring false-positives: a directory whose NAME
+    // merely contains a safe keyword (rather than being exactly that keyword)
+    // must not be classified Safe. Deletion is irreversible, so these guard
+    // against the classifier green-lighting user data.
+
+    #[test]
+    fn mycache_substring_is_not_safe() {
+        // Segment is "mycache", not "cache".
+        let (a, _) = classify(r"C:\Users\test\Documents\MyCache\report.docx");
+        assert_ne!(a, CleanAdvice::Safe);
+    }
+
+    #[test]
+    fn mytemp_substring_is_not_safe() {
+        // Segment is "mytemp", not "temp".
+        let (a, _) = classify(r"C:\Users\test\Documents\MyTemp\notes.txt");
+        assert_ne!(a, CleanAdvice::Safe);
+    }
+
+    #[test]
+    fn windows_old_backup_is_not_safe() {
+        // "windows.oldbackup" must not match the "c:\windows.old" rule.
+        let (a, _) = classify(r"C:\Windows.oldbackup\foo.dll");
+        assert_ne!(a, CleanAdvice::Safe);
+    }
+
+    #[test]
+    fn windows_installer_variant_is_not_caution() {
+        // "installer-backup" is a different segment than "installer".
+        let (a, _) = classify(r"C:\Windows\installer-backup\thing.msi");
+        assert_ne!(a, CleanAdvice::Caution);
+    }
+
+    #[test]
+    fn recycle_bin_variant_is_not_safe() {
+        // "$recycle.bin.bak" must not match "c:\$recycle.bin".
+        let (a, _) = classify(r"C:\$Recycle.Bin.bak\foo");
+        assert_ne!(a, CleanAdvice::Safe);
+    }
+
+    #[test]
+    fn crashdumps_prefix_dir_is_not_safe() {
+        // "crashdumps-archive" is not the "crashdumps" segment.
+        let (a, _) = classify(r"C:\Users\test\AppData\Local\CrashDumps-Archive\report.txt");
+        assert_ne!(a, CleanAdvice::Safe);
+    }
+
+    #[test]
+    fn softwaredistribution_downloads_plural_is_not_safe() {
+        // Canonical cache is ...\Download (singular); plural must not match.
+        let (a, _) = classify(r"C:\Windows\SoftwareDistribution\Downloads\foo.exe");
+        assert_ne!(a, CleanAdvice::Safe);
+    }
+
+    #[test]
+    fn exact_cache_segment_still_safe() {
+        // Positive control: a real "Cache" segment still classifies Safe.
+        let (a, _) = classify(r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default\Cache\data_1");
+        assert_eq!(a, CleanAdvice::Safe);
     }
 }
